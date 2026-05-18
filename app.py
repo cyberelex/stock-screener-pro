@@ -286,8 +286,8 @@ with tab_table:
     show_cols = [c for c in display_cols if c in filtered.columns]
 
     display_df = filtered[show_cols].copy()
-    display_df["Market Cap"] = (display_df["Market Cap"] / 1e6).round(0)
-    display_df = display_df.rename(columns={"Market Cap": "Mkt Cap ($M)"})
+    display_df["Market Cap"] = (display_df["Market Cap"] / 1e9).round(1)
+    display_df = display_df.rename(columns={"Market Cap": "Mkt Cap ($B)"})
 
     st.dataframe(
         display_df.reset_index(drop=True),
@@ -297,7 +297,7 @@ with tab_table:
             "Score": st.column_config.ProgressColumn(
                 "Score", min_value=0, max_value=100, format="%.0f",
             ),
-            "Mkt Cap ($M)": st.column_config.NumberColumn(format="%,.0f"),
+            "Mkt Cap ($B)": st.column_config.NumberColumn(format="%.1f"),
             "Price": st.column_config.NumberColumn(format="$%.2f"),
             "Div Yield %": st.column_config.NumberColumn(format="%.2f%%"),
             "Revenue Growth %": st.column_config.NumberColumn(format="%.1f%%"),

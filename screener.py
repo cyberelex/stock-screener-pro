@@ -135,7 +135,7 @@ def fetch_screening_data(
                     "P/E": info.get("trailingPE"),
                     "Fwd P/E": info.get("forwardPE"),
                     "EPS": info.get("trailingEps"),
-                    "Div Yield %": round(info.get("dividendYield", 0) * 100, 2)
+                    "Div Yield %": round(info.get("dividendYield", 0), 2)
                     if info.get("dividendYield")
                     else 0.0,
                     "P/B": info.get("priceToBook"),
