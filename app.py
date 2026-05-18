@@ -171,8 +171,8 @@ with st.sidebar:
         "No Preset": "Wide-open filters with balanced scoring across all metrics. "
             "Surfaces well-rounded stocks with no glaring weaknesses.",
         "Value Hunting": "Finds cheap, profitable stocks the market may be underpricing. "
-            "Prioritizes low P/E, low P/B, and dividend yield. Best when you want "
-            "to buy quality names at a discount and wait for the market to catch up.",
+            "Prioritizes low P/E, low P/B, and high dividend yield. Best when you want "
+            "to buy quality names at a discount and get paid to wait.",
         "Momentum / Growth": "Finds stocks in strong uptrends with growing revenue. "
             "Prioritizes price near 52-week highs, healthy RSI, and revenue growth. "
             "Best when the market is trending up and you want to ride winners.",
