@@ -296,13 +296,62 @@ with tab_table:
         column_config={
             "Score": st.column_config.ProgressColumn(
                 "Score", min_value=0, max_value=100, format="%.0f",
+                help="Composite score (0–100) based on the selected strategy preset. Higher = better fit for the strategy.",
             ),
-            "Mkt Cap ($B)": st.column_config.NumberColumn(format="%.1f"),
-            "Price": st.column_config.NumberColumn(format="$%.2f"),
-            "Div Yield %": st.column_config.NumberColumn(format="%.2f%%"),
-            "Revenue Growth %": st.column_config.NumberColumn(format="%.1f%%"),
-            "Profit Margin %": st.column_config.NumberColumn(format="%.1f%%"),
-            "% from 52w High": st.column_config.NumberColumn(format="%.1f%%"),
+            "Ticker": st.column_config.TextColumn(
+                help="Stock ticker symbol.",
+            ),
+            "Mkt Cap ($B)": st.column_config.NumberColumn(
+                format="%.1f",
+                help="Market capitalization in billions. Total value of all outstanding shares (price × shares).",
+            ),
+            "Price": st.column_config.NumberColumn(
+                format="$%.2f",
+                help="Latest closing price.",
+            ),
+            "P/E": st.column_config.NumberColumn(
+                help="Price-to-Earnings ratio. How much you pay per $1 of earnings. Lower = cheaper. Typical range: 10–30.",
+            ),
+            "Fwd P/E": st.column_config.NumberColumn(
+                help="Forward P/E. Uses analyst earnings estimates for the next 12 months instead of trailing earnings.",
+            ),
+            "EPS": st.column_config.NumberColumn(
+                help="Earnings Per Share. Net income divided by shares outstanding. Higher = more profitable per share.",
+            ),
+            "Div Yield %": st.column_config.NumberColumn(
+                format="%.2f%%",
+                help="Annual dividend as a % of stock price. Higher = more cash income. Above 4% may signal risk.",
+            ),
+            "P/B": st.column_config.NumberColumn(
+                help="Price-to-Book ratio. Stock price vs net asset value. Below 1.0 = trading below book value (potentially cheap).",
+            ),
+            "Revenue Growth %": st.column_config.NumberColumn(
+                format="%.1f%%",
+                help="Year-over-year revenue growth. Positive = business is growing. Above 20% is strong growth.",
+            ),
+            "Profit Margin %": st.column_config.NumberColumn(
+                format="%.1f%%",
+                help="Net income as a % of revenue. Higher = more efficient at turning sales into profit. Above 20% is strong.",
+            ),
+            "RSI (14)": st.column_config.NumberColumn(
+                help="Relative Strength Index (14-day). Measures momentum. Below 30 = oversold (potential buy). Above 70 = overbought (potential sell). 40–60 = neutral.",
+            ),
+            "50-day MA": st.column_config.NumberColumn(
+                help="50-day moving average. Price above this = short-term uptrend. Price below = short-term downtrend.",
+            ),
+            "200-day MA": st.column_config.NumberColumn(
+                help="200-day moving average. Price above this = long-term uptrend. When 50-MA crosses above 200-MA = 'Golden Cross' (bullish).",
+            ),
+            "Vol vs Avg": st.column_config.NumberColumn(
+                help="Today's volume divided by the 20-day average. Above 1.5 = unusual activity. Above 2.0 = significant spike.",
+            ),
+            "% from 52w High": st.column_config.NumberColumn(
+                format="%.1f%%",
+                help="How far the stock is from its 52-week high. 0% = at the high. -20% = 20% below the high.",
+            ),
+            "Beta": st.column_config.NumberColumn(
+                help="Volatility relative to the market. 1.0 = moves with the market. Above 1.5 = significantly more volatile. Below 0.8 = defensive.",
+            ),
         },
     )
     st.caption(f"Showing {len(filtered)} of {len(df)} stocks · Ranked by {preset_name} score")
