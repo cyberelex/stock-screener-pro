@@ -1,4 +1,5 @@
-"""Stock Screener — Streamlit app with fundamental + technical filters."""
+"""Stock Screener — Streamlit app with fundamental + technical filters,
+paper trading, backtesting, and a robo-trader bot."""
 
 import streamlit as st
 import pandas as pd
@@ -9,6 +10,15 @@ from screener import (
     SP500_TICKERS, UNIVERSES, fetch_screening_data, apply_filters,
     compute_score, detect_regime, adjust_preset_for_regime,
 )
+from database import (
+    get_or_create_portfolio, get_portfolio, execute_trade,
+    get_holdings, get_trade_log, save_snapshot, get_snapshots,
+    enrich_holdings_with_prices, reset_portfolio, list_portfolios,
+    snapshot_all_portfolios, create_challenge, get_active_challenge,
+    is_trading_allowed, cancel_challenge, get_challenge_history,
+)
+from backtest import run_backtest
+from bot import bot_rebalance, get_bot_status, auto_select_strategy
 
 # ── Page config ───────────────────────────────────────────────────────────
 st.set_page_config(page_title="Stock Screener", page_icon="📈", layout="wide")
@@ -73,6 +83,10 @@ df: pd.DataFrame = st.session_state["df"]
 if df.empty:
     st.warning("No data loaded yet. Click **Load / Refresh Data** in the sidebar.")
     st.stop()
+
+if "snapshotted_today" not in st.session_state:
+    snapshot_all_portfolios()
+    st.session_state["snapshotted_today"] = True
 
 # ── Market regime detection ────────────────────────────────────────────────
 regime_info = detect_regime(df)
@@ -274,8 +288,11 @@ c5.metric("Avg Div Yield", f"{filtered['Div Yield %'].mean():.2f}%" if filtered[
 
 st.divider()
 
-# ── Sector distribution chart ─────────────────────────────────────────────
-tab_table, tab_charts, tab_detail = st.tabs(["Screener Results", "Charts", "Stock Detail"])
+# ── Tabs ──────────────────────────────────────────────────────────────────
+tab_table, tab_charts, tab_detail, tab_paper, tab_backtest, tab_vs = st.tabs(
+    ["Screener Results", "Charts", "Stock Detail",
+     "Paper Trading", "Backtest Lab", "You vs Bot"]
+)
 
 with tab_table:
     display_cols = [
@@ -355,6 +372,38 @@ with tab_table:
         },
     )
     st.caption(f"Showing {len(filtered)} of {len(df)} stocks · Ranked by {preset_name} score")
+
+    # ── Quick Buy from screener ───────────────────────────────────────
+    if not filtered.empty:
+        st.divider()
+        trading_ok_scr, trading_msg_scr = is_trading_allowed()
+
+        if not trading_ok_scr:
+            st.info(f"Quick buy disabled — {trading_msg_scr}")
+        else:
+            st.markdown("**Quick Buy**")
+            qb1, qb2, qb3, qb4 = st.columns([2, 1, 1, 1])
+            with qb1:
+                qb_ticker = st.selectbox("Stock", filtered["Ticker"].tolist(), key="qb_ticker")
+            with qb2:
+                qb_row = filtered.loc[filtered["Ticker"] == qb_ticker]
+                qb_price = qb_row["Price"].iloc[0] if not qb_row.empty else 0
+                st.metric("Price", f"${qb_price:.2f}")
+            with qb3:
+                qb_shares = st.number_input("Shares", min_value=0.01, value=10.0, step=1.0, key="qb_shares")
+            with qb4:
+                st.caption(f"Cost: ${qb_shares * qb_price:,.2f}")
+                if st.button("Buy", type="primary", key="qb_buy"):
+                    qb_pid = get_or_create_portfolio("My Portfolio", ptype="manual")
+                    err = execute_trade(qb_pid, qb_ticker, "buy", qb_shares, qb_price,
+                                        reason="Quick buy from screener")
+                    if err:
+                        st.error(err)
+                    else:
+                        qb_port = get_portfolio(qb_pid)
+                        save_snapshot(qb_pid, qb_port["cash"])
+                        st.success(f"Bought {qb_shares:.0f} shares of {qb_ticker} @ ${qb_price:.2f}")
+                        st.rerun()
 
 with tab_charts:
     col_l, col_r = st.columns(2)
@@ -442,3 +491,418 @@ with tab_detail:
             mc8.metric("P/B", f"{r['P/B']:.2f}" if pd.notna(r["P/B"]) else "—")
             mc9.metric("Rev Growth", f"{r['Revenue Growth %']:.1f}%" if pd.notna(r["Revenue Growth %"]) else "—")
             mc10.metric("Profit Margin", f"{r['Profit Margin %']:.1f}%" if pd.notna(r["Profit Margin %"]) else "—")
+
+# ── Paper Trading tab ─────────────────────────────────────────────────────
+with tab_paper:
+    st.subheader("Paper Trading")
+    st.caption("Practice trading with $100k virtual cash. Picks from your screener results.")
+
+    trading_allowed, trading_msg = is_trading_allowed()
+    challenge = get_active_challenge()
+
+    if challenge and challenge["status"] == "locked":
+        st.warning(f"Portfolios are **locked**. {trading_msg}")
+    elif challenge and challenge["status"] == "active":
+        st.success(f"Challenge active: **{challenge['name']}** — {trading_msg}")
+
+    manual_pid = get_or_create_portfolio("My Portfolio", ptype="manual")
+    manual_port = get_portfolio(manual_pid)
+
+    pc1, pc2, pc3 = st.columns(3)
+    holdings_raw = get_holdings(manual_pid)
+    if not holdings_raw.empty:
+        holdings_enriched = enrich_holdings_with_prices(holdings_raw)
+        market_val = holdings_enriched["Market Value"].sum()
+    else:
+        holdings_enriched = holdings_raw
+        market_val = 0
+
+    total_val = manual_port["cash"] + market_val
+    total_pnl = total_val - manual_port["starting_cash"]
+    total_pnl_pct = (total_pnl / manual_port["starting_cash"]) * 100
+
+    pc1.metric("Cash", f"${manual_port['cash']:,.2f}")
+    pc2.metric("Portfolio Value", f"${total_val:,.2f}")
+    pc3.metric("Total P&L", f"${total_pnl:,.2f} ({total_pnl_pct:+.1f}%)")
+
+    st.divider()
+
+    trade_col, holdings_col = st.columns([1, 2])
+
+    with trade_col:
+        st.markdown("**Place a Trade**")
+        if not trading_allowed:
+            st.info("Trading is locked during the hold period. Check the You vs Bot tab for standings.")
+        elif filtered.empty:
+            st.info("Run the screener first to populate the ticker list.")
+            available_tickers = []
+        else:
+            available_tickers = filtered["Ticker"].tolist()
+
+        if trading_allowed and available_tickers:
+            trade_ticker = st.selectbox("Ticker", available_tickers, key="trade_ticker")
+            trade_side = st.radio("Side", ["buy", "sell"], horizontal=True, key="trade_side")
+
+            if trade_ticker:
+                try:
+                    live_price = yf.Ticker(trade_ticker).info.get("currentPrice") or \
+                                 yf.Ticker(trade_ticker).history(period="1d")["Close"].iloc[-1]
+                except Exception:
+                    live_price = filtered.loc[filtered["Ticker"] == trade_ticker, "Price"].iloc[0]
+                st.caption(f"Current price: **${live_price:.2f}**")
+
+            trade_shares = st.number_input("Shares", min_value=0.01, value=10.0, step=1.0, key="trade_shares")
+
+            if trade_side == "buy":
+                cost_preview = trade_shares * live_price
+                st.caption(f"Estimated cost: ${cost_preview:,.2f}")
+
+            if st.button("Execute Trade", type="primary", key="exec_trade"):
+                err = execute_trade(manual_pid, trade_ticker, trade_side,
+                                    trade_shares, live_price, reason="Manual trade")
+                if err:
+                    st.error(err)
+                else:
+                    save_snapshot(manual_pid, total_val)
+                    st.success(f"{'Bought' if trade_side == 'buy' else 'Sold'} "
+                               f"{trade_shares:.2f} shares of {trade_ticker} @ ${live_price:.2f}")
+                    st.rerun()
+
+    with holdings_col:
+        st.markdown("**Current Holdings**")
+        if holdings_enriched.empty:
+            st.info("No holdings yet. Buy some stocks!")
+        else:
+            st.dataframe(
+                holdings_enriched.reset_index(drop=True),
+                use_container_width=True,
+                height=300,
+                column_config={
+                    "P&L ($)": st.column_config.NumberColumn(format="$%.2f"),
+                    "P&L (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Market Value": st.column_config.NumberColumn(format="$%.2f"),
+                    "Current Price": st.column_config.NumberColumn(format="$%.2f"),
+                    "Avg Cost": st.column_config.NumberColumn(format="$%.2f"),
+                },
+            )
+
+    st.divider()
+    st.markdown("**Trade Log**")
+    trade_log = get_trade_log(manual_pid)
+    if trade_log.empty:
+        st.caption("No trades yet.")
+    else:
+        st.dataframe(trade_log, use_container_width=True, height=300)
+
+    st.divider()
+    if st.button("Reset Portfolio", type="secondary", key="reset_manual"):
+        reset_portfolio(manual_pid)
+        st.success("Portfolio reset to $100k cash. All trades cleared.")
+        st.rerun()
+
+
+# ── Backtest Lab tab ──────────────────────────────────────────────────────
+with tab_backtest:
+    st.subheader("Backtest Lab")
+    st.caption("Replay your strategy against historical data to see how it would have performed.")
+
+    bc1, bc2, bc3, bc4 = st.columns(4)
+    with bc1:
+        bt_preset = st.selectbox("Strategy", list(PRESETS.keys()), key="bt_preset")
+    with bc2:
+        bt_topn = st.slider("Top N stocks to hold", 3, 30, 10, key="bt_topn")
+    with bc3:
+        bt_rebal = st.selectbox("Rebalance", ["monthly", "weekly"], key="bt_rebal")
+    with bc4:
+        bt_years = st.slider("Lookback (years)", 1, 5, 2, key="bt_years")
+
+    bt_tickers = selected_tickers or SP500_TICKERS
+
+    if st.button("Run Backtest", type="primary", key="run_bt"):
+        with st.spinner("Running backtest... this may take a few minutes for large universes."):
+            bar = st.progress(0, text="Starting backtest...")
+            results = run_backtest(
+                tickers=bt_tickers,
+                preset=bt_preset,
+                top_n=bt_topn,
+                rebalance_freq=bt_rebal,
+                lookback_years=bt_years,
+                progress_callback=bar.progress,
+            )
+            bar.empty()
+
+        if results["equity_curve"].empty:
+            st.warning("Not enough data to run the backtest. Try fewer tickers or shorter lookback.")
+        else:
+            st.session_state["bt_results"] = results
+
+    if "bt_results" in st.session_state:
+        results = st.session_state["bt_results"]
+        ec = results["equity_curve"]
+        stats = results["stats"]
+
+        st.markdown("### Performance Summary")
+        sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+        sc1.metric("Total Return", stats.get("Total Return", "—"))
+        sc2.metric("Benchmark (SPY)", stats.get("Benchmark Return", "—"))
+        sc3.metric("Max Drawdown", stats.get("Max Drawdown", "—"))
+        sc4.metric("Sharpe Ratio", stats.get("Sharpe Ratio", "—"))
+        sc5.metric("Final Value", stats.get("Final Value", "—"))
+
+        sc6, sc7, sc8 = st.columns(3)
+        sc6.metric("Annualized Return", stats.get("Annualized Return", "—"))
+        sc7.metric("Win Rate", stats.get("Win Rate", "—"))
+        sc8.metric("Total Trades", stats.get("Total Trades", "—"))
+
+        st.markdown("### Equity Curve")
+        fig_eq = go.Figure()
+        fig_eq.add_trace(go.Scatter(
+            x=ec["Date"], y=ec["Portfolio"], mode="lines",
+            name="Your Strategy", line=dict(color="#4F8BF9", width=2),
+        ))
+        fig_eq.add_trace(go.Scatter(
+            x=ec["Date"], y=ec["Benchmark"], mode="lines",
+            name="SPY Benchmark", line=dict(color="#9CA3AF", width=1.5, dash="dash"),
+        ))
+        fig_eq.update_layout(
+            height=450, margin=dict(t=20, b=20),
+            yaxis_title="Portfolio Value ($)",
+            hovermode="x unified",
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
+        )
+        st.plotly_chart(fig_eq, use_container_width=True)
+
+        st.markdown("### Backtest Trades")
+        bt_trades_df = pd.DataFrame(results["trades"])
+        if not bt_trades_df.empty:
+            st.dataframe(bt_trades_df, use_container_width=True, height=300)
+        else:
+            st.caption("No trades generated.")
+
+
+# ── You vs Bot tab ────────────────────────────────────────────────────────
+with tab_vs:
+    st.subheader("You vs Bot")
+    st.caption("The bot runs its own portfolio using the screener's top picks. Compare your manual trades against the algorithm.")
+
+    challenge_vs = get_active_challenge()
+    trading_ok, trading_reason = is_trading_allowed()
+
+    # ── Challenge banner ──────────────────────────────────────────────
+    if challenge_vs:
+        from datetime import date as _date
+        ch = challenge_vs
+        if ch["status"] == "active":
+            days_trade = (_date.fromisoformat(ch["trade_end"]) - _date.today()).days
+            days_total = (_date.fromisoformat(ch["challenge_end"]) - _date.today()).days
+            st.success(
+                f"**{ch['name']}** — Trading window open. "
+                f"**{days_trade} day(s)** left to make your picks, "
+                f"then portfolios lock for {days_total - days_trade} more days."
+            )
+        elif ch["status"] == "locked":
+            days_left = (_date.fromisoformat(ch["challenge_end"]) - _date.today()).days
+            st.warning(
+                f"**{ch['name']}** — Portfolios are **locked**. "
+                f"**{days_left} day(s)** until the challenge ends. "
+                "Just open the app to record daily snapshots."
+            )
+        elif ch["status"] == "completed":
+            if ch.get("winner") == "Cancelled":
+                st.info(f"**{ch['name']}** was cancelled.")
+            else:
+                st.balloons()
+                st.success(f"**{ch['name']}** is over! Winner: **{ch.get('winner', '—')}**")
+
+        if ch["status"] in ("active", "locked"):
+            if st.button("Cancel Challenge", type="secondary", key="cancel_challenge"):
+                cancel_challenge(ch["id"])
+                st.success("Challenge cancelled. Free trading restored.")
+                st.rerun()
+
+    # ── Start a new challenge ─────────────────────────────────────────
+    if not challenge_vs or challenge_vs["status"] == "completed":
+        with st.expander("Start a New Challenge", expanded=not bool(challenge_vs)):
+            st.markdown(
+                "Set a **trading window** to pick your stocks, then a **hold period** "
+                "where portfolios lock and the market decides the winner."
+            )
+            ch_col1, ch_col2, ch_col3, ch_col4 = st.columns(4)
+            with ch_col1:
+                ch_name = st.text_input("Challenge name", value="Week 1 Challenge", key="ch_name")
+            with ch_col2:
+                ch_trade_days = st.number_input("Trading window (days)", 1, 14, 5, key="ch_trade_days")
+            with ch_col3:
+                ch_hold_days = st.number_input("Hold period (days)", 7, 90, 21, key="ch_hold_days")
+            with ch_col4:
+                ch_cash = st.number_input("Starting cash ($)", 10_000, 1_000_000, 100_000,
+                                          step=10_000, key="ch_cash")
+
+            st.caption(
+                f"You and the bot each get **${ch_cash:,.0f}**. "
+                f"Trade for **{ch_trade_days} days**, then hold for **{ch_hold_days} days**. "
+                f"Total challenge: **{ch_trade_days + ch_hold_days} days**."
+            )
+
+            if st.button("Start Challenge", type="primary", key="start_challenge"):
+                create_challenge(ch_name, ch_trade_days, ch_hold_days, ch_cash)
+                st.success(f"Challenge **{ch_name}** started! Both portfolios reset to ${ch_cash:,.0f}. Go make your picks!")
+                st.rerun()
+
+    st.divider()
+
+    # ── Bot controls ──────────────────────────────────────────────────
+    vs_col1, vs_col2 = st.columns(2)
+
+    strategy_options = ["Auto (Best Fit)"] + list(PRESETS.keys())
+    with vs_col1:
+        bot_preset_vs = st.selectbox("Bot Strategy", strategy_options,
+                                     index=0, key="bot_strategy_vs")
+        bot_topn_vs = st.slider("Bot top N holdings", 3, 20, 10, key="bot_topn_vs")
+
+    if bot_preset_vs == "Auto (Best Fit)" and not df.empty:
+        auto_result = auto_select_strategy(df)
+        st.info(auto_result["reasoning"])
+        effective_preset = auto_result["preset"]
+    else:
+        effective_preset = bot_preset_vs if bot_preset_vs != "Auto (Best Fit)" else "No Preset"
+
+    with vs_col2:
+        st.markdown(" ")
+        st.markdown(" ")
+        if not trading_ok:
+            st.info("Bot trading is locked during the hold period.")
+        elif st.button("Run Bot Rebalance Now", type="primary", key="run_bot"):
+            if df.empty:
+                st.warning("Load screener data first.")
+            else:
+                with st.spinner("Bot is trading..."):
+                    result = bot_rebalance(
+                        screener_df=df,
+                        preset=effective_preset,
+                        top_n=bot_topn_vs,
+                    )
+                if "error" in result:
+                    st.error(result["error"])
+                else:
+                    st.success(
+                        f"Bot chose **{effective_preset}** — "
+                        f"{len(result['buys'])} buys, "
+                        f"{len(result['sells'])} sells. "
+                        f"Portfolio: ${result['portfolio_value']:,.2f}"
+                    )
+                    st.rerun()
+
+    st.divider()
+
+    # ── Head-to-head comparison ───────────────────────────────────────
+    manual_pid_vs = get_or_create_portfolio("My Portfolio", ptype="manual")
+    manual_port_vs = get_portfolio(manual_pid_vs)
+    bot_status = get_bot_status("Robo Bot")
+
+    manual_holdings = get_holdings(manual_pid_vs)
+    if not manual_holdings.empty:
+        manual_holdings = enrich_holdings_with_prices(manual_holdings)
+        manual_mkt = manual_holdings["Market Value"].sum()
+    else:
+        manual_mkt = 0
+    manual_total = manual_port_vs["cash"] + manual_mkt
+    manual_pnl = manual_total - manual_port_vs["starting_cash"]
+    manual_pnl_pct = (manual_pnl / manual_port_vs["starting_cash"]) * 100
+
+    bot_total = bot_status["total_value"]
+    bot_pnl = bot_status["pnl"]
+    bot_pnl_pct = bot_status["pnl_pct"]
+
+    st.markdown("### Head-to-Head")
+    h1, h2 = st.columns(2)
+
+    with h1:
+        st.markdown("**Your Portfolio**")
+        m1a, m1b, m1c = st.columns(3)
+        m1a.metric("Value", f"${manual_total:,.0f}")
+        m1b.metric("P&L", f"${manual_pnl:,.0f}")
+        m1c.metric("Return", f"{manual_pnl_pct:+.1f}%")
+
+        if not manual_holdings.empty:
+            st.dataframe(
+                manual_holdings[["Ticker", "Shares", "Market Value", "P&L (%)"]].reset_index(drop=True),
+                use_container_width=True, height=250,
+            )
+        else:
+            st.caption("No holdings. Use the Paper Trading tab to buy stocks.")
+
+    with h2:
+        st.markdown("**Robo Bot Portfolio**")
+        m2a, m2b, m2c = st.columns(3)
+        m2a.metric("Value", f"${bot_total:,.0f}")
+        m2b.metric("P&L", f"${bot_pnl:,.0f}")
+        m2c.metric("Return", f"{bot_pnl_pct:+.1f}%")
+
+        bot_holdings = bot_status["holdings"]
+        if not bot_holdings.empty:
+            display_bot = bot_holdings[["Ticker", "Shares", "Market Value", "P&L (%)"]].reset_index(drop=True) \
+                if "Market Value" in bot_holdings.columns else bot_holdings
+            st.dataframe(display_bot, use_container_width=True, height=250)
+        else:
+            st.caption("Bot hasn't traded yet. Click 'Run Bot Rebalance Now' above.")
+
+    st.divider()
+
+    st.markdown("### Performance Over Time")
+    manual_snaps = get_snapshots(manual_pid_vs)
+    bot_pid_vs = get_or_create_portfolio("Robo Bot", ptype="bot")
+    bot_snaps = get_snapshots(bot_pid_vs)
+
+    if not manual_snaps.empty or not bot_snaps.empty:
+        fig_vs = go.Figure()
+        if not manual_snaps.empty:
+            fig_vs.add_trace(go.Scatter(
+                x=manual_snaps["Date"], y=manual_snaps["Value"],
+                mode="lines+markers", name="You",
+                line=dict(color="#4F8BF9", width=2),
+            ))
+        if not bot_snaps.empty:
+            fig_vs.add_trace(go.Scatter(
+                x=bot_snaps["Date"], y=bot_snaps["Value"],
+                mode="lines+markers", name="Robo Bot",
+                line=dict(color="#F97316", width=2),
+            ))
+        fig_vs.add_hline(y=100_000, line_dash="dot", line_color="gray",
+                         annotation_text="Starting Cash")
+        fig_vs.update_layout(
+            height=400, margin=dict(t=20, b=20),
+            yaxis_title="Portfolio Value ($)",
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_vs, use_container_width=True)
+    else:
+        st.info("Start trading and run the bot to see the performance comparison chart build up over time.")
+
+    st.divider()
+    st.markdown("### Bot Trade Log")
+    bot_trades = get_trade_log(bot_pid_vs)
+    if not bot_trades.empty:
+        st.dataframe(bot_trades, use_container_width=True, height=250)
+    else:
+        st.caption("No bot trades yet.")
+
+    # ── Challenge history ─────────────────────────────────────────────
+    history = get_challenge_history()
+    if history:
+        st.divider()
+        with st.expander("Past Challenges"):
+            for ch in history:
+                result_label = ch.get("winner", "—")
+                st.markdown(
+                    f"**{ch['name']}** — "
+                    f"Trade: {ch['trade_start']} to {ch['trade_end']}, "
+                    f"Hold until: {ch['challenge_end']} — "
+                    f"Result: **{result_label}** ({ch['status']})"
+                )
+
+    st.divider()
+    if st.button("Reset Bot Portfolio", type="secondary", key="reset_bot"):
+        reset_portfolio(bot_pid_vs)
+        st.success("Bot portfolio reset.")
+        st.rerun()
