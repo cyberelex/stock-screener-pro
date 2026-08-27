@@ -5,14 +5,14 @@ from __future__ import annotations
 
 from datetime import date
 
-import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from screener import compute_score, detect_regime, SCORE_WEIGHTS
+from screener import compute_score, detect_regime, SCORE_WEIGHTS, apply_preset_filters
 from database import (
     get_or_create_portfolio, get_portfolio, execute_trade,
-    get_holdings, save_snapshot, enrich_holdings_with_prices,
+    get_holdings, snapshot_portfolio, enrich_holdings_with_prices,
+    portfolio_total_value,
 )
 
 
@@ -22,6 +22,7 @@ from database import (
 _REGIME_AFFINITY = {
     "normal": {
         "Momentum / Growth": 10,
+        "AI Momentum": 6,
         "Value Hunting": 2,
         "Dividend Income": 3,
     },
@@ -41,16 +42,11 @@ _REGIME_AFFINITY = {
 
 
 def auto_select_strategy(screener_df: pd.DataFrame) -> dict:
-    """Evaluate every preset against the current universe and regime,
-    return the best one with reasoning.
+    """Pick a strategy from regime fit plus how many names currently qualify.
 
-    Returns:
-        {
-            "preset": chosen preset name,
-            "regime": detected regime label,
-            "scores": {preset_name: composite_score, ...},
-            "reasoning": human-readable explanation,
-        }
+    Does not compare raw Score values across presets. AI Momentum is an
+    absolute 0–100 checklist; the other presets are percentile ranks inside
+    their own list. Mixing those numbers would always tilt toward AI.
     """
     if screener_df.empty:
         return {"preset": "No Preset", "regime": "Unknown",
@@ -62,27 +58,34 @@ def auto_select_strategy(screener_df: pd.DataFrame) -> dict:
 
     presets_to_test = [p for p in SCORE_WEIGHTS if p != "No Preset"]
     preset_scores = {}
+    passing = {}
 
     for preset_name in presets_to_test:
-        scores = compute_score(screener_df, preset_name)
-        top_10_avg = scores.nlargest(10).mean() if len(scores) >= 10 else scores.mean()
-        spread = scores.nlargest(10).std() if len(scores) >= 10 else scores.std()
+        filtered = apply_preset_filters(screener_df, preset_name, regime)
+        n_pass = len(filtered)
+        passing[preset_name] = n_pass
 
-        # Higher average among the top picks = better signal clarity.
-        # Lower spread = more consistent picks (the bot likes consensus).
-        signal = top_10_avg - (spread * 0.3)
+        if n_pass < 3:
+            opportunity = -15.0
+        elif preset_name == "AI Momentum":
+            setup_avg = float(compute_score(filtered, preset_name).mean())
+            opportunity = setup_avg * 0.1
+        else:
+            opportunity = min(10.0, n_pass / 2)
 
-        regime_bonus = affinity.get(preset_name, 0)
-        preset_scores[preset_name] = round(signal + regime_bonus, 1)
+        preset_scores[preset_name] = round(affinity.get(preset_name, 0) + opportunity, 1)
 
     best = max(preset_scores, key=preset_scores.get)
 
-    parts = [f"Market regime: **{regime_info['label']}**"]
+    parts = [
+        f"Universe regime: **{regime_info['label']}** "
+        "(this loaded list, not the S&P)"
+    ]
     ranked = sorted(preset_scores.items(), key=lambda x: -x[1])
-    parts.append("Strategy scores: " + ", ".join(
-        f"{name} ({sc:.0f})" for name, sc in ranked
+    parts.append("Fit scores (regime bonus + opportunity, not raw stock scores): " + ", ".join(
+        f"{name} ({sc:.0f}, {passing[name]} names)" for name, sc in ranked
     ))
-    parts.append(f"Selected **{best}** — strongest signal for current conditions.")
+    parts.append(f"Selected **{best}** — best regime fit among strategies with enough names.")
 
     return {
         "preset": best,
@@ -119,7 +122,12 @@ def bot_rebalance(
     if screener_df.empty:
         return {"error": "No screener data to work with"}
 
-    scored = screener_df.copy()
+    regime = detect_regime(screener_df)["regime"]
+    candidates = apply_preset_filters(screener_df, preset, regime)
+    if candidates.empty:
+        candidates = screener_df.copy()
+
+    scored = candidates.copy()
     scored["Score"] = compute_score(scored, preset)
     scored = scored.sort_values("Score", ascending=False).head(top_n)
     picks = scored["Ticker"].tolist()
@@ -142,12 +150,13 @@ def bot_rebalance(
 
     portfolio = get_portfolio(pid)
     cash = portfolio["cash"]
+    current_value = portfolio_total_value(pid)
 
     new_tickers = [t for t in picks if t not in held_tickers or t in [s["ticker"] for s in sells]]
     buys = []
     if new_tickers:
         alloc_each = cash / len(new_tickers)
-        max_alloc = portfolio["starting_cash"] * max_position_pct
+        max_alloc = current_value * max_position_pct
 
         for ticker in new_tickers:
             try:
@@ -163,8 +172,7 @@ def bot_rebalance(
             if not err:
                 buys.append({"ticker": ticker, "shares": round(shares, 4), "price": price})
 
-    total_value = _compute_portfolio_value(pid)
-    save_snapshot(pid, total_value, date.today().isoformat())
+    total_value = snapshot_portfolio(pid, date.today().isoformat())
 
     return {
         "picks": picks,
@@ -184,7 +192,7 @@ def get_bot_status(portfolio_name: str = "Robo Bot") -> dict:
     if not holdings_df.empty:
         holdings_df = enrich_holdings_with_prices(holdings_df)
 
-    total_value = _compute_portfolio_value(pid)
+    total_value = portfolio_total_value(pid)
     starting = portfolio["starting_cash"]
     pnl = total_value - starting
     pnl_pct = (pnl / starting) * 100 if starting > 0 else 0
@@ -208,21 +216,3 @@ def _get_current_price(ticker: str) -> float:
     if not hist.empty:
         return hist["Close"].iloc[-1]
     raise ValueError(f"No price for {ticker}")
-
-
-def _compute_portfolio_value(pid: int) -> float:
-    portfolio = get_portfolio(pid)
-    cash = portfolio["cash"]
-    holdings_df = get_holdings(pid)
-    if holdings_df.empty:
-        return cash
-
-    market_value = 0
-    for _, row in holdings_df.iterrows():
-        try:
-            price = _get_current_price(row["Ticker"])
-            market_value += row["Shares"] * price
-        except Exception:
-            continue
-
-    return cash + market_value

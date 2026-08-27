@@ -8,12 +8,13 @@ import yfinance as yf
 
 from screener import (
     SP500_TICKERS, UNIVERSES, AI_SLEEVE_ORDER, fetch_screening_data,
-    apply_filters, compute_score, detect_regime, adjust_preset_for_regime,
+    apply_filters, compute_score, compute_ai_setup_score, detect_regime,
+    adjust_preset_for_regime, PRESETS, ALL_MA_OPTIONS, MARKET_CAP_BOUNDS,
 )
 from database import (
     get_or_create_portfolio, get_portfolio, execute_trade,
-    get_holdings, get_trade_log, save_snapshot, get_snapshots,
-    enrich_holdings_with_prices, reset_portfolio, list_portfolios,
+    get_holdings, get_trade_log, snapshot_portfolio, get_snapshots,
+    enrich_holdings_with_prices, reset_portfolio,
     snapshot_all_portfolios, create_challenge, get_active_challenge,
     is_trading_allowed, cancel_challenge, get_challenge_history,
 )
@@ -94,127 +95,63 @@ regime = regime_info["regime"]
 
 if regime == "selloff":
     st.error(
-        f"**Market Regime: {regime_info['label']}** — "
+        f"**Universe regime: {regime_info['label']}** — "
         f"Median RSI {regime_info['stats']['median_rsi']}, "
         f"Median drawdown {regime_info['stats']['median_drawdown']}%, "
-        f"{regime_info['stats']['pct_below_200ma']}% below 200-MA. "
+        f"{regime_info['stats']['pct_below_200ma']}% below 200-MA "
+        f"in the loaded list (not the S&P). "
         "Preset filters have been widened automatically."
     )
 elif regime == "stressed":
     st.warning(
-        f"**Market Regime: {regime_info['label']}** — "
+        f"**Universe regime: {regime_info['label']}** — "
         f"Median RSI {regime_info['stats']['median_rsi']}, "
         f"Median drawdown {regime_info['stats']['median_drawdown']}%, "
-        f"{regime_info['stats']['pct_below_200ma']}% below 200-MA. "
+        f"{regime_info['stats']['pct_below_200ma']}% below 200-MA "
+        f"in the loaded list (not the S&P). "
         "Preset filters slightly relaxed."
     )
 else:
     st.success(
-        f"**Market Regime: Normal** — "
+        f"**Universe regime: Normal** — "
         f"Median RSI {regime_info['stats']['median_rsi']}, "
         f"Median drawdown {regime_info['stats']['median_drawdown']}%, "
-        f"{regime_info['stats']['pct_below_200ma']}% below 200-MA."
+        f"{regime_info['stats']['pct_below_200ma']}% below 200-MA "
+        f"in the loaded list (not the S&P)."
     )
 
-# ── Presets ────────────────────────────────────────────────────────────────
-DIVIDEND_SECTORS = ["Utilities", "Consumer Defensive", "Real Estate", "Energy",
-                    "Financial Services", "Communication Services"]
-ALL_MA_OPTIONS = ["None", "Above 50-MA", "Above 200-MA", "Golden Cross (50 > 200)"]
-
-PRESETS = {
-    "No Preset": {
-        "pe": (0.0, 80.0),
-        "mktcap": "Any",
-        "div_min": 0.0,
-        "rsi": (10.0, 90.0),
-        "ma": "None",
-        "vol_spike": 0.0,
-        "pct_high": -80.0,
-        "sectors": None,
-    },
-    "Value Hunting": {
-        "pe": (2.0, 25.0),
-        "mktcap": "Any",
-        "div_min": 1.0,
-        "rsi": (0.0, 55.0),
-        "ma": "None",
-        "vol_spike": 0.0,
-        "pct_high": -80.0,
-        "sectors": None,
-    },
-    "Momentum / Growth": {
-        "pe": (0.0, 80.0),
-        "mktcap": "Any",
-        "div_min": 0.0,
-        "rsi": (45.0, 75.0),
-        "ma": "Above 50-MA",
-        "vol_spike": 0.0,
-        "pct_high": -15.0,
-        "sectors": None,
-    },
-    "Dividend Income": {
-        "pe": (2.0, 35.0),
-        "mktcap": "Any",
-        "div_min": 1.5,
-        "rsi": (0.0, 70.0),
-        "ma": "None",
-        "vol_spike": 0.0,
-        "pct_high": -80.0,
-        "sectors": None,
-    },
-    "Oversold Bounce": {
-        "pe": (0.0, 80.0),
-        "mktcap": "Any",
-        "div_min": 0.0,
-        "rsi": (0.0, 40.0),
-        "ma": "None",
-        "vol_spike": 0.5,
-        "pct_high": -80.0,
-        "sectors": None,
-    },
-    "AI Momentum": {
-        "pe": (0.0, 150.0),
-        "mktcap": "Any",
-        "div_min": 0.0,
-        "rsi": (40.0, 80.0),
-        "ma": "Above 50-MA",
-        "vol_spike": 0.0,
-        "pct_high": -25.0,
-        "sectors": None,
-    },
+# ── Sidebar: filters ──────────────────────────────────────────────────────
+PRESET_DESCRIPTIONS = {
+    "No Preset": "Wide-open filters with balanced scoring across all metrics. "
+        "Surfaces well-rounded stocks with no glaring weaknesses.",
+    "Value Hunting": "Finds cheap, profitable stocks the market may be underpricing. "
+        "Prioritizes low P/E, low P/B, and high dividend yield. Best when you want "
+        "to buy quality names at a discount and get paid to wait.",
+    "Momentum / Growth": "Finds stocks in strong uptrends with growing revenue. "
+        "Prioritizes price near 52-week highs, healthy RSI, and revenue growth. "
+        "Best when the market is trending up and you want to ride winners.",
+    "Dividend Income": "Finds reliable dividend payers with sustainable earnings. "
+        "Prioritizes high yield backed by reasonable P/E and profit margins. "
+        "Best for building a portfolio that generates steady cash flow.",
+    "Oversold Bounce": "Finds beaten-down stocks showing signs of life. "
+        "Prioritizes low RSI, large drawdowns from highs, and unusual volume. "
+        "Best for contrarian, short-term tactical trades after sharp selloffs.",
+    "AI Momentum": "Ranks the AI stack against an ideal setup: above the 50- and "
+        "200-day, RSI 50–70, beating or keeping up with NVDA, near the 52-week high, "
+        "and green on the week and month. Score is a 0–100 checklist, not a relative rank. "
+        "Ideal 80+, Good 60–79, Mixed 40–59, Weak below 40.",
 }
 
-# ── Sidebar: filters ──────────────────────────────────────────────────────
 with st.sidebar:
     st.divider()
     st.header("Strategy Preset")
     preset_name = st.selectbox("Apply a preset", list(PRESETS.keys()))
     p = adjust_preset_for_regime(PRESETS[preset_name], regime)
 
-    PRESET_DESCRIPTIONS = {
-        "No Preset": "Wide-open filters with balanced scoring across all metrics. "
-            "Surfaces well-rounded stocks with no glaring weaknesses.",
-        "Value Hunting": "Finds cheap, profitable stocks the market may be underpricing. "
-            "Prioritizes low P/E, low P/B, and high dividend yield. Best when you want "
-            "to buy quality names at a discount and get paid to wait.",
-        "Momentum / Growth": "Finds stocks in strong uptrends with growing revenue. "
-            "Prioritizes price near 52-week highs, healthy RSI, and revenue growth. "
-            "Best when the market is trending up and you want to ride winners.",
-        "Dividend Income": "Finds reliable dividend payers with sustainable earnings. "
-            "Prioritizes high yield backed by reasonable P/E and profit margins. "
-            "Best for building a portfolio that generates steady cash flow.",
-        "Oversold Bounce": "Finds beaten-down stocks showing signs of life. "
-            "Prioritizes low RSI, large drawdowns from highs, and unusual volume. "
-            "Best for contrarian, short-term tactical trades after sharp selloffs.",
-        "AI Momentum": "Finds AI-stack names still in an uptrend. "
-            "Ignores dividend yield and allows high P/E. Scores revenue growth, "
-            "distance from 52-week highs, 1-month return, and relative strength vs NVDA. "
-            "Best when you want to watch chips, data-center infra, and AI software.",
-    }
     st.info(PRESET_DESCRIPTIONS.get(preset_name, ""))
 
     if regime != "normal" and preset_name != "No Preset":
-        st.caption(f"⚙ Filters adjusted for **{regime_info['label']}** market")
+        st.caption(f"Filters adjusted for **{regime_info['label']}** in this universe")
 
     st.divider()
     st.header("Fundamental Filters")
@@ -223,6 +160,8 @@ with st.sidebar:
     default_sectors = (
         [s for s in p["sectors"] if s in sectors] if p["sectors"] else sectors
     )
+    if p["sectors"] and not default_sectors:
+        default_sectors = sectors
     sel_sectors = st.multiselect("Sector", sectors, default=default_sectors)
 
     sleeve_options = [
@@ -250,20 +189,13 @@ with st.sidebar:
         step=1.0,
     )
 
-    mktcap_choices = {
-        "Any": (0, None),
-        "Mega (>200B)": (200_000_000_000, None),
-        "Large (10B–200B)": (10_000_000_000, 200_000_000_000),
-        "Mid (2B–10B)": (2_000_000_000, 10_000_000_000),
-        "Small (<2B)": (0, 2_000_000_000),
-    }
-    mktcap_keys = list(mktcap_choices.keys())
+    mktcap_keys = list(MARKET_CAP_BOUNDS.keys())
     mktcap_label = st.selectbox(
         "Market Cap",
         mktcap_keys,
         index=mktcap_keys.index(p["mktcap"]),
     )
-    mktcap_lo, mktcap_hi = mktcap_choices[mktcap_label]
+    mktcap_lo, mktcap_hi = MARKET_CAP_BOUNDS[mktcap_label]
 
     div_min = st.slider("Min Dividend Yield %", 0.0, 10.0, p["div_min"], 0.1)
 
@@ -307,7 +239,13 @@ elif ma_filter == "Golden Cross (50 > 200)":
 
 # ── Score ──────────────────────────────────────────────────────────────────
 if not filtered.empty:
-    filtered["Score"] = compute_score(filtered, preset_name)
+    if preset_name == "AI Momentum":
+        setup = compute_ai_setup_score(filtered)
+        filtered["Score"] = setup["Setup Score"]
+        filtered["Setup"] = setup["Setup"]
+        filtered["Setup Note"] = setup["Setup Note"]
+    else:
+        filtered["Score"] = compute_score(filtered, preset_name)
     filtered = filtered.sort_values("Score", ascending=False).reset_index(drop=True)
 
 # ── Summary metrics ───────────────────────────────────────────────────────
@@ -332,16 +270,20 @@ with tab_table:
         ai_watch = ai_watch[ai_watch["AI Sleeve"].isin(sel_sleeves)]
     if not ai_watch.empty:
         expanded = universe_label == "AI Stack"
-        with st.expander("AI Watchlist — 1D / 1W / 1M and vs NVDA", expanded=expanded):
+        with st.expander("AI Watchlist — ranked by ideal setup", expanded=expanded):
             watch = ai_watch.copy()
+            setup = compute_ai_setup_score(watch)
+            watch["Score"] = setup["Setup Score"]
+            watch["Setup"] = setup["Setup"]
+            watch["Setup Note"] = setup["Setup Note"]
             watch["vs 50"] = watch["Above 50-MA"].map({True: "Above", False: "Below"})
             watch["vs 200"] = watch["Above 200-MA"].map({True: "Above", False: "Below"})
-            watch = watch.sort_values("1D %", ascending=False, na_position="last")
+            watch = watch.sort_values("Score", ascending=False, na_position="last")
             watch_cols = [
                 c for c in [
-                    "Ticker", "Name", "AI Sleeve", "Price",
+                    "Score", "Setup", "Ticker", "Name", "AI Sleeve", "Price",
                     "1D %", "1W %", "1M %", "RS vs NVDA",
-                    "RSI (14)", "vs 50", "vs 200",
+                    "RSI (14)", "vs 50", "vs 200", "Setup Note",
                 ]
                 if c in watch.columns
             ]
@@ -350,6 +292,17 @@ with tab_table:
                 use_container_width=True,
                 height=min(420, 48 + 35 * len(watch)),
                 column_config={
+                    "Score": st.column_config.ProgressColumn(
+                        "Score", min_value=0, max_value=100, format="%.0f",
+                        help="Ideal AI setup: trend 30, RSI zone 20, vs NVDA 20, near high 15, 1W/1M 15.",
+                    ),
+                    "Setup": st.column_config.TextColumn(
+                        help="Ideal 80+ · Good 60–79 · Mixed 40–59 · Weak below 40.",
+                    ),
+                    "Setup Note": st.column_config.TextColumn(
+                        help="Why it scored this way.",
+                        width="large",
+                    ),
                     "Price": st.column_config.NumberColumn(format="$%.2f"),
                     "1D %": st.column_config.NumberColumn(
                         format="%+.1f%%",
@@ -368,7 +321,7 @@ with tab_table:
                         help="1-month return minus NVDA's 1-month return. Positive = outperforming NVDA.",
                     ),
                     "RSI (14)": st.column_config.NumberColumn(
-                        help="Below 30 = oversold. Above 70 = overbought.",
+                        help="Ideal zone is 50–70. Below 40 = washed out. Above 80 = stretched.",
                     ),
                     "AI Sleeve": st.column_config.TextColumn(
                         help="Chips, Infra (data centers/power), or Software.",
@@ -382,15 +335,17 @@ with tab_table:
                 },
             )
             st.caption(
-                f"{len(watch)} AI-stack names in this universe · "
-                "RS vs NVDA = 1M % minus NVDA 1M %"
+                f"{len(watch)} AI-stack names · ranked by setup score · "
+                "Ideal 80+ · Good 60–79 · Mixed 40–59 · Weak <40 · "
+                "Points: trend 30, RSI 20, vs NVDA 20, near high 15, 1W/1M 15"
             )
 
     display_cols = [
-        "Score", "Ticker", "Name", "AI Sleeve", "Sector", "Price", "Market Cap",
+        "Score", "Setup", "Ticker", "Name", "AI Sleeve", "Sector", "Price", "Market Cap",
         "1D %", "1W %", "1M %", "RS vs NVDA", "P/E", "Fwd P/E",
         "EPS", "Div Yield %", "P/B", "Revenue Growth %", "Profit Margin %",
         "RSI (14)", "50-day MA", "200-day MA", "Vol vs Avg", "% from 52w High", "Beta",
+        "Setup Note",
     ]
     show_cols = [c for c in display_cols if c in filtered.columns]
 
@@ -405,7 +360,14 @@ with tab_table:
         column_config={
             "Score": st.column_config.ProgressColumn(
                 "Score", min_value=0, max_value=100, format="%.0f",
-                help="Composite score (0–100) based on the selected strategy preset. Higher = better fit for the strategy.",
+                help="For AI Momentum: 0–100 ideal-setup checklist. Other presets: relative rank in the current list.",
+            ),
+            "Setup": st.column_config.TextColumn(
+                help="Ideal 80+ · Good 60–79 · Mixed 40–59 · Weak below 40.",
+            ),
+            "Setup Note": st.column_config.TextColumn(
+                help="Why the AI setup score landed here.",
+                width="large",
             ),
             "Ticker": st.column_config.TextColumn(
                 help="Stock ticker symbol.",
@@ -511,8 +473,7 @@ with tab_table:
                     if err:
                         st.error(err)
                     else:
-                        qb_port = get_portfolio(qb_pid)
-                        save_snapshot(qb_pid, qb_port["cash"])
+                        snapshot_portfolio(qb_pid)
                         st.success(f"Bought {qb_shares:.0f} shares of {qb_ticker} @ ${qb_price:.2f}")
                         st.rerun()
 
@@ -606,7 +567,10 @@ with tab_detail:
 # ── Paper Trading tab ─────────────────────────────────────────────────────
 with tab_paper:
     st.subheader("Paper Trading")
-    st.caption("Practice trading with $100k virtual cash. Picks from your screener results.")
+    st.caption(
+        "Practice trading with $100k virtual cash. Picks from your screener results. "
+        "On Streamlit Community Cloud the local database resets when the app reboots."
+    )
 
     trading_allowed, trading_msg = is_trading_allowed()
     challenge = get_active_challenge()
@@ -674,7 +638,7 @@ with tab_paper:
                 if err:
                     st.error(err)
                 else:
-                    save_snapshot(manual_pid, total_val)
+                    snapshot_portfolio(manual_pid)
                     st.success(f"{'Bought' if trade_side == 'buy' else 'Sold'} "
                                f"{trade_shares:.2f} shares of {trade_ticker} @ ${live_price:.2f}")
                     st.rerun()
@@ -715,7 +679,12 @@ with tab_paper:
 # ── Backtest Lab tab ──────────────────────────────────────────────────────
 with tab_backtest:
     st.subheader("Backtest Lab")
-    st.caption("Replay your strategy against historical data to see how it would have performed.")
+    st.caption(
+        "Price-only replay: RSI, trend, drawdown, and volume. "
+        "Live P/E, yield, and growth are not available historically, so Value Hunting "
+        "and Dividend Income here are technical approximations, not the live screener. "
+        "AI Momentum uses the same setup checklist (trend, RSI, vs NVDA, near high, 1W/1M)."
+    )
 
     bc1, bc2, bc3, bc4 = st.columns(4)
     with bc1:
@@ -764,6 +733,9 @@ with tab_backtest:
         sc6.metric("Annualized Return", stats.get("Annualized Return", "—"))
         sc7.metric("Win Rate", stats.get("Win Rate", "—"))
         sc8.metric("Total Trades", stats.get("Total Trades", "—"))
+
+        if results.get("note"):
+            st.info(results["note"])
 
         st.markdown("### Equity Curve")
         fig_eq = go.Figure()

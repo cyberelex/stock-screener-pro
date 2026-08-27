@@ -167,11 +167,8 @@ def get_active_challenge() -> dict | None:
 def _determine_winner(challenge_id: int) -> str:
     manual_pid = get_or_create_portfolio("My Portfolio", ptype="manual")
     bot_pid = get_or_create_portfolio("Robo Bot", ptype="bot")
-    manual_snaps = get_snapshots(manual_pid)
-    bot_snaps = get_snapshots(bot_pid)
-
-    manual_final = manual_snaps["Value"].iloc[-1] if not manual_snaps.empty else 100_000
-    bot_final = bot_snaps["Value"].iloc[-1] if not bot_snaps.empty else 100_000
+    manual_final = portfolio_total_value(manual_pid)
+    bot_final = portfolio_total_value(bot_pid)
 
     if manual_final > bot_final:
         return "You"
@@ -301,6 +298,27 @@ def get_trade_log(pid: int, limit: int = 100) -> pd.DataFrame:
 
 # ── Snapshot helpers ──────────────────────────────────────────────────────
 
+def portfolio_total_value(pid: int) -> float:
+    """Cash plus marked-to-market holdings. Missing prices are skipped."""
+    portfolio = get_portfolio(pid)
+    if not portfolio:
+        return 0.0
+    cash = portfolio["cash"]
+    holdings_df = get_holdings(pid)
+    if holdings_df.empty:
+        return cash
+    holdings_df = enrich_holdings_with_prices(holdings_df)
+    market_value = pd.to_numeric(holdings_df.get("Market Value"), errors="coerce").fillna(0).sum()
+    return float(cash + market_value)
+
+
+def snapshot_portfolio(pid: int, dt: str | None = None) -> float:
+    """Save today's (or *dt*) total portfolio value and return it."""
+    total = portfolio_total_value(pid)
+    save_snapshot(pid, total, dt)
+    return total
+
+
 def save_snapshot(pid: int, total_value: float, dt: str | None = None) -> None:
     dt = dt or date.today().isoformat()
     with _conn() as c:
@@ -342,22 +360,7 @@ def snapshot_all_portfolios() -> None:
             ).fetchone()
         if exists:
             continue
-
-        holdings = get_holdings(pid)
-        if holdings.empty:
-            save_snapshot(pid, p["cash"], today)
-            continue
-
-        market_value = 0
-        for _, row in holdings.iterrows():
-            try:
-                tk = yf.Ticker(row["Ticker"])
-                price = tk.info.get("currentPrice") or \
-                        tk.history(period="1d")["Close"].iloc[-1]
-                market_value += row["Shares"] * price
-            except Exception:
-                continue
-        save_snapshot(pid, p["cash"] + market_value, today)
+        snapshot_portfolio(pid, today)
 
 
 def enrich_holdings_with_prices(holdings_df: pd.DataFrame) -> pd.DataFrame:

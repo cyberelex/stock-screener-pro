@@ -112,6 +112,21 @@ UNIVERSES: dict[str, list[str]] = {
 }
 
 
+def _normalize_dividend_yield(raw) -> float:
+    """Yahoo sometimes returns yield as a ratio (0.023) and sometimes as percent (2.3)."""
+    if raw is None:
+        return 0.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if value <= 0:
+        return 0.0
+    if value <= 1.0:
+        value *= 100
+    return round(value, 2)
+
+
 def _return_pct(close: pd.Series, periods: int) -> float | None:
     """Percent change from *periods* trading days ago to the latest close."""
     if close is None or len(close) <= periods:
@@ -201,9 +216,7 @@ def fetch_screening_data(
                     "P/E": info.get("trailingPE"),
                     "Fwd P/E": info.get("forwardPE"),
                     "EPS": info.get("trailingEps"),
-                    "Div Yield %": round(info.get("dividendYield", 0), 2)
-                    if info.get("dividendYield")
-                    else 0.0,
+                    "Div Yield %": _normalize_dividend_yield(info.get("dividendYield")),
                     "P/B": info.get("priceToBook"),
                     "Revenue Growth %": round(info.get("revenueGrowth", 0) * 100, 1)
                     if info.get("revenueGrowth")
@@ -262,7 +275,13 @@ def detect_regime(df: pd.DataFrame) -> dict:
       - label / color: for UI display
     """
     if df.empty:
-        return {"regime": "normal", "label": "Normal", "color": "green", "stats": {}}
+        return {
+            "regime": "normal",
+            "label": "Normal",
+            "color": "green",
+            "stats": {},
+            "scope": "this universe",
+        }
 
     median_rsi = df["RSI (14)"].median() if df["RSI (14)"].notna().any() else 50.0
     median_drawdown = df["% from 52w High"].median() if df["% from 52w High"].notna().any() else 0.0
@@ -286,11 +305,29 @@ def detect_regime(df: pd.DataFrame) -> dict:
         selloff_signals += 1
 
     if selloff_signals >= 2:
-        return {"regime": "selloff", "label": "Broad Selloff", "color": "red", "stats": stats}
+        return {
+            "regime": "selloff",
+            "label": "Broad Selloff",
+            "color": "red",
+            "stats": stats,
+            "scope": "this universe",
+        }
     elif selloff_signals == 1:
-        return {"regime": "stressed", "label": "Stressed", "color": "orange", "stats": stats}
+        return {
+            "regime": "stressed",
+            "label": "Stressed",
+            "color": "orange",
+            "stats": stats,
+            "scope": "this universe",
+        }
     else:
-        return {"regime": "normal", "label": "Normal", "color": "green", "stats": stats}
+        return {
+            "regime": "normal",
+            "label": "Normal",
+            "color": "green",
+            "stats": stats,
+            "scope": "this universe",
+        }
 
 
 # Adjustments applied to preset filter values during stressed/selloff regimes
@@ -311,7 +348,12 @@ REGIME_ADJUSTMENTS = {
 
 
 def adjust_preset_for_regime(preset: dict, regime: str) -> dict:
-    """Return a copy of *preset* with filter ranges shifted for the regime."""
+    """Widen filters in stress; do not slide a momentum RSI band down into oversold.
+
+    Lower RSI bound moves down. Upper RSI bound stays put when the preset already
+    has a floor (Momentum). When the floor is 0 (Value / Oversold / Dividend), the
+    ceiling rises so more names can pass instead of getting squeezed.
+    """
     if regime == "normal":
         return preset
 
@@ -320,13 +362,27 @@ def adjust_preset_for_regime(preset: dict, regime: str) -> dict:
 
     rsi_lo, rsi_hi = p["rsi"]
     shift = adj.get("rsi_shift", 0)
-    p["rsi"] = (max(0.0, rsi_lo + shift), max(10.0, rsi_hi + shift))
+    new_lo = max(0.0, rsi_lo + shift)
+    if rsi_lo > 0:
+        new_hi = rsi_hi
+    else:
+        new_hi = min(100.0, rsi_hi - shift)
+    p["rsi"] = (new_lo, max(new_lo + 5.0, new_hi))
 
     p["pct_high"] = max(-80.0, p["pct_high"] + adj.get("pct_high_shift", 0))
     p["div_min"] = round(p["div_min"] * adj.get("div_min_mult", 1.0), 1)
     p["pe"] = (p["pe"][0], p["pe"][1] + adj.get("pe_hi_add", 0))
 
     return p
+
+
+# Fundamentals with missing values should not fail a range filter (unprofitable
+# AI names often have no P/E). Technicals still drop NaN so we don't pass names
+# we cannot actually measure.
+KEEP_NA_FILTER_COLS = {
+    "P/E", "Fwd P/E", "P/B", "Market Cap", "Div Yield %",
+    "Revenue Growth %", "Profit Margin %", "EPS", "Beta",
+}
 
 
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
@@ -336,11 +392,131 @@ def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
         if col not in result.columns:
             continue
         series = pd.to_numeric(result[col], errors="coerce")
+        mask = pd.Series(True, index=result.index)
         if lo is not None:
-            result = result[series >= lo]
-            series = series.loc[result.index]
+            mask &= series >= lo
         if hi is not None:
-            result = result[series <= hi]
+            mask &= series <= hi
+        if col in KEEP_NA_FILTER_COLS:
+            mask |= series.isna()
+        result = result[mask]
+    return result
+
+
+DIVIDEND_SECTORS = [
+    "Utilities", "Consumer Defensive", "Real Estate", "Energy",
+    "Financial Services", "Communication Services",
+]
+ALL_MA_OPTIONS = ["None", "Above 50-MA", "Above 200-MA", "Golden Cross (50 > 200)"]
+MARKET_CAP_BOUNDS: dict[str, tuple[float | None, float | None]] = {
+    "Any": (0, None),
+    "Mega (>200B)": (200_000_000_000, None),
+    "Large (10B–200B)": (10_000_000_000, 200_000_000_000),
+    "Mid (2B–10B)": (2_000_000_000, 10_000_000_000),
+    "Small (<2B)": (0, 2_000_000_000),
+}
+
+PRESETS: dict[str, dict] = {
+    "No Preset": {
+        "pe": (0.0, 80.0),
+        "mktcap": "Any",
+        "div_min": 0.0,
+        "rsi": (10.0, 90.0),
+        "ma": "None",
+        "vol_spike": 0.0,
+        "pct_high": -80.0,
+        "sectors": None,
+    },
+    "Value Hunting": {
+        "pe": (2.0, 25.0),
+        "mktcap": "Any",
+        "div_min": 1.0,
+        "rsi": (0.0, 55.0),
+        "ma": "None",
+        "vol_spike": 0.0,
+        "pct_high": -80.0,
+        "sectors": None,
+    },
+    "Momentum / Growth": {
+        "pe": (0.0, 80.0),
+        "mktcap": "Any",
+        "div_min": 0.0,
+        "rsi": (45.0, 75.0),
+        "ma": "Above 50-MA",
+        "vol_spike": 0.0,
+        "pct_high": -15.0,
+        "sectors": None,
+    },
+    "Dividend Income": {
+        "pe": (2.0, 35.0),
+        "mktcap": "Any",
+        "div_min": 1.5,
+        "rsi": (0.0, 70.0),
+        "ma": "None",
+        "vol_spike": 0.0,
+        "pct_high": -80.0,
+        "sectors": DIVIDEND_SECTORS,
+    },
+    "Oversold Bounce": {
+        "pe": (0.0, 80.0),
+        "mktcap": "Any",
+        "div_min": 0.0,
+        "rsi": (0.0, 40.0),
+        "ma": "None",
+        "vol_spike": 0.5,
+        "pct_high": -80.0,
+        "sectors": None,
+    },
+    "AI Momentum": {
+        "pe": (0.0, 150.0),
+        "mktcap": "Any",
+        "div_min": 0.0,
+        "rsi": (0.0, 100.0),
+        "ma": "None",
+        "vol_spike": 0.0,
+        "pct_high": -80.0,
+        "sectors": None,
+    },
+}
+
+
+def apply_preset_filters(
+    df: pd.DataFrame,
+    preset_name: str,
+    regime: str = "normal",
+) -> pd.DataFrame:
+    """Apply a strategy's default filters, including regime widening."""
+    preset = PRESETS.get(preset_name, PRESETS["No Preset"])
+    p = adjust_preset_for_regime(preset, regime)
+    result = df.copy()
+
+    if p.get("sectors"):
+        sector_match = result["Sector"].isin(p["sectors"])
+        if sector_match.any():
+            result = result[sector_match]
+
+    mktcap_lo, mktcap_hi = MARKET_CAP_BOUNDS.get(p.get("mktcap", "Any"), (0, None))
+    range_filters = {
+        "P/E": p["pe"],
+        "Market Cap": (mktcap_lo, mktcap_hi),
+        "Div Yield %": (p["div_min"], None),
+        "RSI (14)": p["rsi"],
+        "Vol vs Avg": (p["vol_spike"], None),
+        "% from 52w High": (p["pct_high"], None),
+    }
+    result = apply_filters(result, range_filters)
+
+    ma_filter = p.get("ma", "None")
+    if ma_filter == "Above 50-MA":
+        result = result[result["Above 50-MA"] == True]
+    elif ma_filter == "Above 200-MA":
+        result = result[result["Above 200-MA"] == True]
+    elif ma_filter == "Golden Cross (50 > 200)":
+        result = result[
+            result["50-day MA"].notna()
+            & result["200-day MA"].notna()
+            & (result["50-day MA"] > result["200-day MA"])
+        ]
     return result
 
 
@@ -398,13 +574,131 @@ SCORE_WEIGHTS: dict[str, list[tuple[str, float, bool]]] = {
 }
 
 
+def compute_ai_setup_score(df: pd.DataFrame) -> pd.DataFrame:
+    """Score each row 0–100 against the AI 'ideal setup'.
+
+    Points: trend 30, RSI zone 20, vs NVDA 20, near 52-week high 15,
+    1-week/1-month participation 15. This is an absolute checklist, not a
+    percentile rank against the current universe.
+    """
+    out = pd.DataFrame(index=df.index)
+    if df.empty:
+        out["Setup Score"] = pd.Series(dtype=float)
+        out["Setup"] = pd.Series(dtype=str)
+        out["Setup Note"] = pd.Series(dtype=str)
+        return out
+
+    above50 = df.get("Above 50-MA", False)
+    if not isinstance(above50, pd.Series):
+        above50 = pd.Series(False, index=df.index)
+    above50 = above50.fillna(False).astype(bool)
+
+    above200 = df.get("Above 200-MA", False)
+    if not isinstance(above200, pd.Series):
+        above200 = pd.Series(False, index=df.index)
+    above200 = above200.fillna(False).astype(bool)
+
+    trend_pts = np.where(above50, 15, 0) + np.where(above200, 15, 0)
+
+    def _col(name: str) -> pd.Series:
+        if name not in df.columns:
+            return pd.Series(np.nan, index=df.index)
+        return pd.to_numeric(df[name], errors="coerce")
+
+    rsi = _col("RSI (14)")
+    rsi_pts = np.select(
+        [
+            (rsi >= 50) & (rsi <= 70),
+            ((rsi >= 40) & (rsi < 50)) | ((rsi > 70) & (rsi <= 80)),
+            ((rsi >= 30) & (rsi < 40)) | ((rsi > 80) & (rsi <= 85)),
+        ],
+        [20, 12, 5],
+        default=0,
+    )
+
+    rs = _col("RS vs NVDA")
+    rs_pts = np.select(
+        [rs >= 5, rs >= 0, rs >= -5],
+        [20, 15, 8],
+        default=0,
+    )
+
+    drawdown = _col("% from 52w High")
+    high_pts = np.select(
+        [drawdown >= -8, drawdown >= -15, drawdown >= -25],
+        [15, 10, 5],
+        default=0,
+    )
+
+    week = _col("1W %")
+    month = _col("1M %")
+    align_pts = np.where(month > 0, 8, 0) + np.where(week > 0, 7, 0)
+
+    total = (
+        pd.Series(trend_pts, index=df.index)
+        + pd.Series(rsi_pts, index=df.index)
+        + pd.Series(rs_pts, index=df.index)
+        + pd.Series(high_pts, index=df.index)
+        + pd.Series(align_pts, index=df.index)
+    )
+    out["Setup Score"] = total.clip(0, 100).round(0)
+
+    out["Setup"] = np.select(
+        [out["Setup Score"] >= 80, out["Setup Score"] >= 60, out["Setup Score"] >= 40],
+        ["Ideal", "Good", "Mixed"],
+        default="Weak",
+    )
+
+    notes: list[str] = []
+    for i in df.index:
+        bits: list[str] = []
+        if bool(above50.loc[i]) and bool(above200.loc[i]):
+            bits.append("above 50 & 200")
+        elif bool(above50.loc[i]):
+            bits.append("above 50 only")
+        elif bool(above200.loc[i]):
+            bits.append("above 200, below 50")
+        else:
+            bits.append("below both MAs")
+
+        rsi_i = rsi.loc[i] if i in rsi.index else np.nan
+        if pd.isna(rsi_i):
+            bits.append("no RSI")
+        elif 50 <= rsi_i <= 70:
+            bits.append(f"RSI {rsi_i:.0f} ideal")
+        elif rsi_i > 80:
+            bits.append(f"RSI {rsi_i:.0f} stretched")
+        elif rsi_i < 40:
+            bits.append(f"RSI {rsi_i:.0f} washed out")
+        else:
+            bits.append(f"RSI {rsi_i:.0f} OK")
+
+        rs_i = rs.loc[i] if i in rs.index else np.nan
+        if pd.notna(rs_i):
+            bits.append("beating NVDA" if rs_i >= 0 else "lagging NVDA")
+
+        dd_i = drawdown.loc[i] if i in drawdown.index else np.nan
+        if pd.notna(dd_i):
+            if dd_i >= -8:
+                bits.append("near high")
+            elif dd_i < -25:
+                bits.append("far from high")
+
+        notes.append(" · ".join(bits))
+
+    out["Setup Note"] = notes
+    return out
+
+
 def compute_score(df: pd.DataFrame, preset: str) -> pd.Series:
     """Return a 0–100 composite score for each row based on *preset* weights.
 
-    Uses percentile ranks within the filtered set so scores are always
-    relative to the current universe.  Missing values get 50th-percentile
-    (neutral) so they neither help nor hurt.
+    AI Momentum uses an absolute setup checklist. Other presets use percentile
+    ranks within the filtered set. Missing values get 50th-percentile (neutral).
     """
+    if preset == "AI Momentum":
+        return compute_ai_setup_score(df)["Setup Score"]
+
     weights = SCORE_WEIGHTS.get(preset, SCORE_WEIGHTS["No Preset"])
     total_weight = sum(w for _, w, _ in weights)
     score = pd.Series(0.0, index=df.index)
