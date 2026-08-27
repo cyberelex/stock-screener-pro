@@ -17,9 +17,78 @@ from database import (
     enrich_holdings_with_prices, reset_portfolio,
     snapshot_all_portfolios, create_challenge, get_active_challenge,
     is_trading_allowed, cancel_challenge, get_challenge_history,
+    add_to_watchlist, remove_from_watchlist, get_watchlist,
 )
 from backtest import run_backtest
 from bot import bot_rebalance, get_bot_status, auto_select_strategy
+
+WATCHLIST_TABLE_COLS = [
+    "Score", "Setup", "Ticker", "Name", "AI Sleeve", "Price",
+    "1D %", "1W %", "1M %", "3M %", "6M %", "12M %", "RS vs NVDA",
+    "RSI (14)", "vs 50", "vs 200", "Setup Note",
+]
+
+
+def _score_watch_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    if out.empty:
+        return out
+    setup = compute_ai_setup_score(out)
+    out["Score"] = setup["Setup Score"]
+    out["Setup"] = setup["Setup"]
+    out["Setup Note"] = setup["Setup Note"]
+    if "Above 50-MA" in out.columns:
+        out["vs 50"] = out["Above 50-MA"].map({True: "Above", False: "Below"})
+    if "Above 200-MA" in out.columns:
+        out["vs 200"] = out["Above 200-MA"].map({True: "Above", False: "Below"})
+    return out.sort_values("Score", ascending=False, na_position="last")
+
+
+def _watchlist_column_config() -> dict:
+    return {
+        "Score": st.column_config.ProgressColumn(
+            "Score", min_value=0, max_value=100, format="%.0f",
+            help="Ideal AI setup: trend 30, RSI zone 20, vs NVDA 20, near high 15, 1W/1M 15.",
+        ),
+        "Setup": st.column_config.TextColumn(
+            help="Ideal 80+ · Good 60–79 · Mixed 40–59 · Weak below 40.",
+        ),
+        "Setup Note": st.column_config.TextColumn(
+            help="Why it scored this way.",
+            width="large",
+        ),
+        "Price": st.column_config.NumberColumn(format="$%.2f"),
+        "1D %": st.column_config.NumberColumn(
+            format="%+.1f%%", help="1-day percent change.",
+        ),
+        "1W %": st.column_config.NumberColumn(
+            format="%+.1f%%", help="5-session percent change.",
+        ),
+        "1M %": st.column_config.NumberColumn(
+            format="%+.1f%%", help="21-session percent change.",
+        ),
+        "3M %": st.column_config.NumberColumn(
+            format="%+.1f%%", help="63-session percent change (~3 months).",
+        ),
+        "6M %": st.column_config.NumberColumn(
+            format="%+.1f%%", help="126-session percent change (~6 months).",
+        ),
+        "12M %": st.column_config.NumberColumn(
+            format="%+.1f%%", help="252-session percent change (~12 months).",
+        ),
+        "RS vs NVDA": st.column_config.NumberColumn(
+            format="%+.1f",
+            help="1-month return minus NVDA's 1-month return. Positive = outperforming NVDA.",
+        ),
+        "RSI (14)": st.column_config.NumberColumn(
+            help="Ideal zone is 50–70. Below 40 = washed out. Above 80 = stretched.",
+        ),
+        "AI Sleeve": st.column_config.TextColumn(
+            help="Chips, Infra (data centers/power), Software, or not tagged.",
+        ),
+        "vs 50": st.column_config.TextColumn(help="Price vs 50-day moving average."),
+        "vs 200": st.column_config.TextColumn(help="Price vs 200-day moving average."),
+    }
 
 # ── Page config ───────────────────────────────────────────────────────────
 st.set_page_config(page_title="Stock Screener", page_icon="📈", layout="wide")
@@ -62,6 +131,9 @@ with st.sidebar:
         st.caption(f"{len(selected_tickers)} tickers")
 
     load_btn = st.button("Load / Refresh Data", type="primary", use_container_width=True)
+    wl_n = len(get_watchlist())
+    if wl_n:
+        st.caption(f"My Watchlist: {wl_n} names · see the My Watchlist tab")
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -80,6 +152,7 @@ if load_btn or "df" not in st.session_state:
     st.session_state["df"] = _load(cache_key, selected_tickers)
 
 df: pd.DataFrame = st.session_state["df"]
+saved_watchlist = get_watchlist()
 
 if df.empty:
     st.warning("No data loaded yet. Click **Load / Refresh Data** in the sidebar.")
@@ -259,8 +332,8 @@ c5.metric("Avg Div Yield", f"{filtered['Div Yield %'].mean():.2f}%" if filtered[
 st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────
-tab_table, tab_charts, tab_detail, tab_paper, tab_backtest, tab_vs = st.tabs(
-    ["Screener Results", "Charts", "Stock Detail",
+tab_table, tab_watch, tab_charts, tab_detail, tab_paper, tab_backtest, tab_vs = st.tabs(
+    ["Screener Results", "My Watchlist", "Charts", "Stock Detail",
      "Paper Trading", "Backtest Lab", "You vs Bot"]
 )
 
@@ -270,7 +343,7 @@ with tab_table:
         ai_watch = ai_watch[ai_watch["AI Sleeve"].isin(sel_sleeves)]
     if not ai_watch.empty:
         expanded = universe_label == "AI Stack"
-        with st.expander("AI Watchlist — ranked by ideal setup", expanded=expanded):
+        with st.expander("AI stack ranking — by ideal setup", expanded=expanded):
             watch = ai_watch.copy()
             setup = compute_ai_setup_score(watch)
             watch["Score"] = setup["Setup Score"]
@@ -470,6 +543,39 @@ with tab_table:
     )
     st.caption(f"Showing {len(filtered)} of {len(df)} stocks · Ranked by {preset_name} score")
 
+    # ── Add to personal watchlist ─────────────────────────────────────
+    add_source = filtered if not filtered.empty else df
+    if not add_source.empty:
+        st.divider()
+        st.markdown("**Add to My Watchlist**")
+        wa1, wa2, wa3 = st.columns([2, 1, 2])
+        with wa1:
+            add_ticker = st.selectbox(
+                "Stock",
+                add_source["Ticker"].tolist(),
+                key="scr_watch_ticker",
+            )
+        with wa2:
+            st.write("")
+            st.write("")
+            if add_ticker in saved_watchlist:
+                if st.button("Remove", key="scr_watch_remove"):
+                    remove_from_watchlist(add_ticker)
+                    st.rerun()
+            else:
+                if st.button("Add to Watchlist", type="primary", key="scr_watch_add"):
+                    err = add_to_watchlist(add_ticker)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.success(f"Added {add_ticker}")
+                        st.rerun()
+        with wa3:
+            if add_ticker in saved_watchlist:
+                st.caption(f"{add_ticker} is on My Watchlist")
+            else:
+                st.caption("Opens on the My Watchlist tab")
+
     # ── Quick Buy from screener ───────────────────────────────────────
     if not filtered.empty:
         st.divider()
@@ -500,6 +606,91 @@ with tab_table:
                         snapshot_portfolio(qb_pid)
                         st.success(f"Bought {qb_shares:.0f} shares of {qb_ticker} @ ${qb_price:.2f}")
                         st.rerun()
+
+with tab_watch:
+    st.subheader("My Watchlist")
+    st.caption(
+        "Your saved names, ranked by AI setup score. "
+        "Add from Screener Results or Stock Detail, or type a ticker below. "
+        "On Streamlit Community Cloud this list resets if the app reboots."
+    )
+
+    saved_watchlist = get_watchlist()
+    add_col, _ = st.columns([2, 2])
+    with add_col:
+        typed = st.text_input("Add ticker", placeholder="e.g. ANET", key="watch_typed")
+        if st.button("Add ticker", type="primary", key="watch_typed_add"):
+            err = add_to_watchlist(typed)
+            if err:
+                st.error(err)
+            else:
+                st.success(f"Added {typed.strip().upper()}")
+                st.rerun()
+
+    if not saved_watchlist:
+        st.info(
+            "Watchlist is empty. On Screener Results pick a stock and click "
+            "**Add to Watchlist**, or type a ticker above."
+        )
+    else:
+        loaded_tickers = set(df["Ticker"].tolist()) if not df.empty else set()
+        missing = [t for t in saved_watchlist if t not in loaded_tickers]
+        have = df[df["Ticker"].isin(saved_watchlist)].copy() if not df.empty else pd.DataFrame()
+        extra = pd.DataFrame()
+        if missing:
+            extra_key = ",".join(missing)
+            if st.session_state.get("wl_extra_key") != extra_key:
+                with st.spinner(f"Loading {', '.join(missing)}…"):
+                    extra = fetch_screening_data(missing)
+                st.session_state["wl_extra_df"] = extra
+                st.session_state["wl_extra_key"] = extra_key
+            else:
+                extra = st.session_state.get("wl_extra_df", pd.DataFrame())
+            still_missing = [t for t in missing if extra.empty or t not in extra["Ticker"].tolist()]
+            if still_missing:
+                st.warning("Could not load: " + ", ".join(still_missing))
+
+        parts = [p for p in [have, extra] if not p.empty]
+        watch_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+        if watch_df.empty:
+            st.warning("No data for your watchlist tickers. Try Load / Refresh Data.")
+        else:
+            watch_df = _score_watch_frame(watch_df)
+            w1, w2, w3, w4 = st.columns(4)
+            w1.metric("Names", f"{len(watch_df)}")
+            w2.metric(
+                "Avg Score",
+                f"{watch_df['Score'].mean():.0f}" if watch_df["Score"].notna().any() else "—",
+            )
+            ideal_n = int((watch_df["Setup"] == "Ideal").sum()) if "Setup" in watch_df.columns else 0
+            w3.metric("Ideal", f"{ideal_n}")
+            w4.metric(
+                "Avg RSI",
+                f"{watch_df['RSI (14)'].mean():.0f}" if watch_df["RSI (14)"].notna().any() else "—",
+            )
+
+            show_cols = [c for c in WATCHLIST_TABLE_COLS if c in watch_df.columns]
+            st.dataframe(
+                watch_df[show_cols].reset_index(drop=True),
+                use_container_width=True,
+                height=min(560, 48 + 38 * max(len(watch_df), 3)),
+                column_config=_watchlist_column_config(),
+            )
+            st.caption(
+                f"{len(watch_df)} saved names · ranked by setup score · "
+                "Ideal 80+ · Good 60–79 · Mixed 40–59 · Weak <40"
+            )
+
+        rm1, rm2 = st.columns([2, 1])
+        with rm1:
+            rm_ticker = st.selectbox("Remove", saved_watchlist, key="watch_remove_pick")
+        with rm2:
+            st.write("")
+            st.write("")
+            if st.button("Remove", key="watch_remove_btn"):
+                remove_from_watchlist(rm_ticker)
+                st.rerun()
 
 with tab_charts:
     col_l, col_r = st.columns(2)
@@ -543,6 +734,20 @@ with tab_detail:
     )
 
     if selected_ticker:
+        d1, d2 = st.columns([1, 5])
+        with d1:
+            if selected_ticker in saved_watchlist:
+                if st.button("Remove from Watchlist", key="detail_watch_remove"):
+                    remove_from_watchlist(selected_ticker)
+                    st.rerun()
+            else:
+                if st.button("Add to Watchlist", type="primary", key="detail_watch_add"):
+                    err = add_to_watchlist(selected_ticker)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.success(f"Added {selected_ticker}")
+                        st.rerun()
         tk = yf.Ticker(selected_ticker)
         hist_6m = tk.history(period="6mo")
 

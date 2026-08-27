@@ -62,6 +62,10 @@ def init_db() -> None:
                 winner          TEXT,
                 created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS watchlist (
+                ticker      TEXT PRIMARY KEY,
+                added_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            );
         """)
 
 
@@ -382,6 +386,39 @@ def enrich_holdings_with_prices(holdings_df: pd.DataFrame) -> pd.DataFrame:
     df["P&L ($)"] = ((df["Current Price"] - df["Avg Cost"]) * df["Shares"]).round(2)
     df["P&L (%)"] = (((df["Current Price"] / df["Avg Cost"]) - 1) * 100).round(1)
     return df
+
+
+# ── Personal watchlist ────────────────────────────────────────────────────
+
+def add_to_watchlist(ticker: str) -> str | None:
+    """Add a ticker. Returns an error string, or None on success."""
+    ticker = (ticker or "").strip().upper()
+    if not ticker or len(ticker) > 12:
+        return "Enter a valid ticker"
+    with _conn() as c:
+        exists = c.execute(
+            "SELECT 1 FROM watchlist WHERE ticker = ?", (ticker,)
+        ).fetchone()
+        if exists:
+            return f"{ticker} is already on your watchlist"
+        c.execute("INSERT INTO watchlist (ticker) VALUES (?)", (ticker,))
+    return None
+
+
+def remove_from_watchlist(ticker: str) -> None:
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        return
+    with _conn() as c:
+        c.execute("DELETE FROM watchlist WHERE ticker = ?", (ticker,))
+
+
+def get_watchlist() -> list[str]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT ticker FROM watchlist ORDER BY added_at, ticker"
+        ).fetchall()
+    return [r["ticker"] for r in rows]
 
 
 init_db()
