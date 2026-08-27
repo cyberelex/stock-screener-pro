@@ -7,8 +7,8 @@ import plotly.graph_objects as go
 import yfinance as yf
 
 from screener import (
-    SP500_TICKERS, UNIVERSES, fetch_screening_data, apply_filters,
-    compute_score, detect_regime, adjust_preset_for_regime,
+    SP500_TICKERS, UNIVERSES, AI_SLEEVE_ORDER, fetch_screening_data,
+    apply_filters, compute_score, detect_regime, adjust_preset_for_regime,
 )
 from database import (
     get_or_create_portfolio, get_portfolio, execute_trade,
@@ -172,6 +172,16 @@ PRESETS = {
         "pct_high": -80.0,
         "sectors": None,
     },
+    "AI Momentum": {
+        "pe": (0.0, 150.0),
+        "mktcap": "Any",
+        "div_min": 0.0,
+        "rsi": (40.0, 80.0),
+        "ma": "Above 50-MA",
+        "vol_spike": 0.0,
+        "pct_high": -25.0,
+        "sectors": None,
+    },
 }
 
 # ── Sidebar: filters ──────────────────────────────────────────────────────
@@ -196,6 +206,10 @@ with st.sidebar:
         "Oversold Bounce": "Finds beaten-down stocks showing signs of life. "
             "Prioritizes low RSI, large drawdowns from highs, and unusual volume. "
             "Best for contrarian, short-term tactical trades after sharp selloffs.",
+        "AI Momentum": "Finds AI-stack names still in an uptrend. "
+            "Ignores dividend yield and allows high P/E. Scores revenue growth, "
+            "distance from 52-week highs, 1-month return, and relative strength vs NVDA. "
+            "Best when you want to watch chips, data-center infra, and AI software.",
     }
     st.info(PRESET_DESCRIPTIONS.get(preset_name, ""))
 
@@ -211,12 +225,28 @@ with st.sidebar:
     )
     sel_sectors = st.multiselect("Sector", sectors, default=default_sectors)
 
+    sleeve_options = [
+        s for s in AI_SLEEVE_ORDER if s in df["AI Sleeve"].dropna().unique().tolist()
+    ]
+    extra_sleeves = sorted(
+        s for s in df["AI Sleeve"].dropna().unique().tolist() if s not in sleeve_options
+    )
+    sleeve_options = sleeve_options + extra_sleeves
+    sel_sleeves = st.multiselect(
+        "AI Sleeve",
+        sleeve_options,
+        default=sleeve_options,
+        help="Chips = semis and equipment. Infra = power, cooling, colocation, servers, networking. Software = hyperscalers and AI platforms. — = not in the AI stack.",
+    )
+
     pe_max_bound = float(min(df["P/E"].dropna().max(), 200)) if df["P/E"].notna().any() else 200.0
+    pe_hi = min(float(p["pe"][1]), pe_max_bound)
+    pe_lo = min(float(p["pe"][0]), pe_hi)
     pe_range = st.slider(
         "P/E Ratio",
         min_value=0.0,
         max_value=pe_max_bound,
-        value=(p["pe"][0], min(p["pe"][1], pe_max_bound)),
+        value=(pe_lo, pe_hi),
         step=1.0,
     )
 
@@ -251,6 +281,8 @@ with st.sidebar:
 
 # ── Apply filters ─────────────────────────────────────────────────────────
 filtered = df[df["Sector"].isin(sel_sectors)].copy()
+if sel_sleeves:
+    filtered = filtered[filtered["AI Sleeve"].isin(sel_sleeves)]
 
 range_filters = {
     "P/E": (pe_range[0], pe_range[1]),
@@ -295,8 +327,68 @@ tab_table, tab_charts, tab_detail, tab_paper, tab_backtest, tab_vs = st.tabs(
 )
 
 with tab_table:
+    ai_watch = df[df["AI Sleeve"].isin(["Chips", "Infra", "Software"])].copy()
+    if sel_sleeves:
+        ai_watch = ai_watch[ai_watch["AI Sleeve"].isin(sel_sleeves)]
+    if not ai_watch.empty:
+        expanded = universe_label == "AI Stack"
+        with st.expander("AI Watchlist — 1D / 1W / 1M and vs NVDA", expanded=expanded):
+            watch = ai_watch.copy()
+            watch["vs 50"] = watch["Above 50-MA"].map({True: "Above", False: "Below"})
+            watch["vs 200"] = watch["Above 200-MA"].map({True: "Above", False: "Below"})
+            watch = watch.sort_values("1D %", ascending=False, na_position="last")
+            watch_cols = [
+                c for c in [
+                    "Ticker", "Name", "AI Sleeve", "Price",
+                    "1D %", "1W %", "1M %", "RS vs NVDA",
+                    "RSI (14)", "vs 50", "vs 200",
+                ]
+                if c in watch.columns
+            ]
+            st.dataframe(
+                watch[watch_cols].reset_index(drop=True),
+                use_container_width=True,
+                height=min(420, 48 + 35 * len(watch)),
+                column_config={
+                    "Price": st.column_config.NumberColumn(format="$%.2f"),
+                    "1D %": st.column_config.NumberColumn(
+                        format="%+.1f%%",
+                        help="1-day percent change.",
+                    ),
+                    "1W %": st.column_config.NumberColumn(
+                        format="%+.1f%%",
+                        help="5-session percent change.",
+                    ),
+                    "1M %": st.column_config.NumberColumn(
+                        format="%+.1f%%",
+                        help="21-session percent change.",
+                    ),
+                    "RS vs NVDA": st.column_config.NumberColumn(
+                        format="%+.1f",
+                        help="1-month return minus NVDA's 1-month return. Positive = outperforming NVDA.",
+                    ),
+                    "RSI (14)": st.column_config.NumberColumn(
+                        help="Below 30 = oversold. Above 70 = overbought.",
+                    ),
+                    "AI Sleeve": st.column_config.TextColumn(
+                        help="Chips, Infra (data centers/power), or Software.",
+                    ),
+                    "vs 50": st.column_config.TextColumn(
+                        help="Price vs 50-day moving average.",
+                    ),
+                    "vs 200": st.column_config.TextColumn(
+                        help="Price vs 200-day moving average.",
+                    ),
+                },
+            )
+            st.caption(
+                f"{len(watch)} AI-stack names in this universe · "
+                "RS vs NVDA = 1M % minus NVDA 1M %"
+            )
+
     display_cols = [
-        "Score", "Ticker", "Name", "Sector", "Price", "Market Cap", "P/E", "Fwd P/E",
+        "Score", "Ticker", "Name", "AI Sleeve", "Sector", "Price", "Market Cap",
+        "1D %", "1W %", "1M %", "RS vs NVDA", "P/E", "Fwd P/E",
         "EPS", "Div Yield %", "P/B", "Revenue Growth %", "Profit Margin %",
         "RSI (14)", "50-day MA", "200-day MA", "Vol vs Avg", "% from 52w High", "Beta",
     ]
@@ -368,6 +460,25 @@ with tab_table:
             ),
             "Beta": st.column_config.NumberColumn(
                 help="Volatility relative to the market. 1.0 = moves with the market. Above 1.5 = significantly more volatile. Below 0.8 = defensive.",
+            ),
+            "AI Sleeve": st.column_config.TextColumn(
+                help="AI stack role: Chips, Infra (data centers/power), Software, or — if not tagged.",
+            ),
+            "1D %": st.column_config.NumberColumn(
+                format="%+.1f%%",
+                help="1-day percent change.",
+            ),
+            "1W %": st.column_config.NumberColumn(
+                format="%+.1f%%",
+                help="5-session percent change.",
+            ),
+            "1M %": st.column_config.NumberColumn(
+                format="%+.1f%%",
+                help="21-session percent change.",
+            ),
+            "RS vs NVDA": st.column_config.NumberColumn(
+                format="%+.1f",
+                help="1-month return minus NVDA's 1-month return. Positive = outperforming NVDA.",
             ),
         },
     )

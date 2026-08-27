@@ -73,14 +73,80 @@ INTERNATIONAL_ADRS: list[str] = [
     "VALE", "VOD", "WIT", "WPP", "XPEV",
 ]
 
+# Curated AI value-chain: chips/tools, data-center infra, and software platforms.
+AI_SLEEVE_GROUPS: dict[str, list[str]] = {
+    "Chips": [
+        "NVDA", "AVGO", "TSM", "ASML", "AMAT", "LRCX", "KLAC", "AMD",
+        "MU", "QCOM", "ARM", "MRVL", "INTC", "SNPS", "CDNS", "TXN",
+    ],
+    "Infra": [
+        "VRT", "ETN", "GEV", "CEG", "VST", "NRG", "EQIX", "DLR",
+        "SMCI", "ANET", "DELL", "HPE", "CSCO", "CRDO", "COHR", "CCJ", "PWR",
+    ],
+    "Software": [
+        "MSFT", "GOOGL", "AMZN", "META", "ORCL", "NOW", "CRM", "PLTR",
+        "SNOW", "PANW", "CRWD", "DDOG", "NET", "ADSK",
+    ],
+}
+AI_SLEEVES: dict[str, str] = {
+    ticker: sleeve
+    for sleeve, tickers in AI_SLEEVE_GROUPS.items()
+    for ticker in tickers
+}
+AI_STACK_TICKERS: list[str] = [
+    ticker for tickers in AI_SLEEVE_GROUPS.values() for ticker in tickers
+]
+AI_SLEEVE_ORDER: list[str] = list(AI_SLEEVE_GROUPS.keys()) + ["—"]
+
 UNIVERSES: dict[str, list[str]] = {
     "S&P 500 (~200)": SP500_TICKERS,
+    "AI Stack": AI_STACK_TICKERS,
     "Nasdaq 100": NASDAQ100_TICKERS,
     "Mid-Caps (~150)": MIDCAP_TICKERS,
     "International ADRs (~55)": INTERNATIONAL_ADRS,
     "S&P 500 + Mid-Caps (~350)": sorted(set(SP500_TICKERS + MIDCAP_TICKERS)),
-    "All Universes (~500)": sorted(set(SP500_TICKERS + NASDAQ100_TICKERS + MIDCAP_TICKERS + INTERNATIONAL_ADRS)),
+    "All Universes (~500)": sorted(set(
+        SP500_TICKERS + NASDAQ100_TICKERS + MIDCAP_TICKERS
+        + INTERNATIONAL_ADRS + AI_STACK_TICKERS
+    )),
 }
+
+
+def _return_pct(close: pd.Series, periods: int) -> float | None:
+    """Percent change from *periods* trading days ago to the latest close."""
+    if close is None or len(close) <= periods:
+        return None
+    prev = close.iloc[-1 - periods]
+    last = close.iloc[-1]
+    if pd.isna(prev) or pd.isna(last) or prev == 0:
+        return None
+    return round(float((last / prev - 1) * 100), 1)
+
+
+def _attach_relative_strength(df: pd.DataFrame) -> pd.DataFrame:
+    """1-month return minus NVDA's 1-month return. Positive = beating NVDA."""
+    if df.empty or "1M %" not in df.columns:
+        return df
+
+    nvda_1m = None
+    nvda_row = df.loc[df["Ticker"] == "NVDA", "1M %"]
+    if not nvda_row.empty and pd.notna(nvda_row.iloc[0]):
+        nvda_1m = float(nvda_row.iloc[0])
+    else:
+        try:
+            hist = yf.Ticker("NVDA").history(period="3mo")
+            if not hist.empty:
+                nvda_1m = _return_pct(hist["Close"], 21)
+        except Exception:
+            nvda_1m = None
+
+    if nvda_1m is None or pd.isna(nvda_1m):
+        df["RS vs NVDA"] = None
+    else:
+        df["RS vs NVDA"] = (
+            pd.to_numeric(df["1M %"], errors="coerce") - nvda_1m
+        ).round(1)
+    return df
 
 
 def _rsi(series: pd.Series, period: int = 14) -> float:
@@ -156,6 +222,10 @@ def fetch_screening_data(
                     "Sector": info.get("sector", "—"),
                     "Industry": info.get("industry", "—"),
                     "Name": info.get("shortName", ticker),
+                    "AI Sleeve": AI_SLEEVES.get(ticker, "—"),
+                    "1D %": _return_pct(close, 1),
+                    "1W %": _return_pct(close, 5),
+                    "1M %": _return_pct(close, 21),
                 }
             )
         except Exception:
@@ -170,6 +240,7 @@ def fetch_screening_data(
         df["Above 200-MA"] = df["Price"] > df["200-day MA"]
         df["Vol vs Avg"] = (df["Volume"] / df["Avg Vol (20d)"]).round(2)
         df["% from 52w High"] = (((df["Price"] - df["52w High"]) / df["52w High"]) * 100).round(1)
+        df = _attach_relative_strength(df)
     return df
 
 
@@ -315,6 +386,14 @@ SCORE_WEIGHTS: dict[str, list[tuple[str, float, bool]]] = {
         ("Vol vs Avg",       0.25, False),
         ("Revenue Growth %", 0.10, False),
         ("P/E",              0.10, True),
+    ],
+    "AI Momentum": [
+        ("Revenue Growth %", 0.25, False),
+        ("% from 52w High",  0.20, False),
+        ("1M %",             0.20, False),
+        ("RS vs NVDA",       0.15, False),
+        ("RSI (14)",         0.10, False),
+        ("Profit Margin %",  0.10, False),
     ],
 }
 
