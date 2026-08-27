@@ -282,7 +282,7 @@ with tab_table:
             watch_cols = [
                 c for c in [
                     "Score", "Setup", "Ticker", "Name", "AI Sleeve", "Price",
-                    "1D %", "1W %", "1M %", "RS vs NVDA",
+                    "1D %", "1W %", "1M %", "3M %", "6M %", "12M %", "RS vs NVDA",
                     "RSI (14)", "vs 50", "vs 200", "Setup Note",
                 ]
                 if c in watch.columns
@@ -316,6 +316,18 @@ with tab_table:
                         format="%+.1f%%",
                         help="21-session percent change.",
                     ),
+                    "3M %": st.column_config.NumberColumn(
+                        format="%+.1f%%",
+                        help="63-session percent change (~3 months).",
+                    ),
+                    "6M %": st.column_config.NumberColumn(
+                        format="%+.1f%%",
+                        help="126-session percent change (~6 months).",
+                    ),
+                    "12M %": st.column_config.NumberColumn(
+                        format="%+.1f%%",
+                        help="252-session percent change (~12 months).",
+                    ),
                     "RS vs NVDA": st.column_config.NumberColumn(
                         format="%+.1f",
                         help="1-month return minus NVDA's 1-month return. Positive = outperforming NVDA.",
@@ -342,7 +354,7 @@ with tab_table:
 
     display_cols = [
         "Score", "Setup", "Ticker", "Name", "AI Sleeve", "Sector", "Price", "Market Cap",
-        "1D %", "1W %", "1M %", "RS vs NVDA", "P/E", "Fwd P/E",
+        "1D %", "1W %", "1M %", "3M %", "6M %", "12M %", "RS vs NVDA", "P/E", "Fwd P/E",
         "EPS", "Div Yield %", "P/B", "Revenue Growth %", "Profit Margin %",
         "RSI (14)", "50-day MA", "200-day MA", "Vol vs Avg", "% from 52w High", "Beta",
         "Setup Note",
@@ -437,6 +449,18 @@ with tab_table:
             "1M %": st.column_config.NumberColumn(
                 format="%+.1f%%",
                 help="21-session percent change.",
+            ),
+            "3M %": st.column_config.NumberColumn(
+                format="%+.1f%%",
+                help="63-session percent change (~3 months).",
+            ),
+            "6M %": st.column_config.NumberColumn(
+                format="%+.1f%%",
+                help="126-session percent change (~6 months).",
+            ),
+            "12M %": st.column_config.NumberColumn(
+                format="%+.1f%%",
+                help="252-session percent change (~12 months).",
             ),
             "RS vs NVDA": st.column_config.NumberColumn(
                 format="%+.1f",
@@ -563,6 +587,18 @@ with tab_detail:
             mc8.metric("P/B", f"{r['P/B']:.2f}" if pd.notna(r["P/B"]) else "—")
             mc9.metric("Rev Growth", f"{r['Revenue Growth %']:.1f}%" if pd.notna(r["Revenue Growth %"]) else "—")
             mc10.metric("Profit Margin", f"{r['Profit Margin %']:.1f}%" if pd.notna(r["Profit Margin %"]) else "—")
+
+            def _ret(col: str) -> str:
+                val = r.get(col)
+                return f"{val:+.1f}%" if pd.notna(val) else "—"
+
+            rc1, rc2, rc3, rc4, rc5, rc6 = st.columns(6)
+            rc1.metric("1D", _ret("1D %"))
+            rc2.metric("1W", _ret("1W %"))
+            rc3.metric("1M", _ret("1M %"))
+            rc4.metric("3M", _ret("3M %"))
+            rc5.metric("6M", _ret("6M %"))
+            rc6.metric("12M", _ret("12M %"))
 
 # ── Paper Trading tab ─────────────────────────────────────────────────────
 with tab_paper:

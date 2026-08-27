@@ -194,7 +194,7 @@ def fetch_screening_data(
         try:
             tk = yf.Ticker(ticker)
             info = tk.info or {}
-            hist = tk.history(period="1y")
+            hist = tk.history(period="2y")
 
             if hist.empty:
                 continue
@@ -239,6 +239,9 @@ def fetch_screening_data(
                     "1D %": _return_pct(close, 1),
                     "1W %": _return_pct(close, 5),
                     "1M %": _return_pct(close, 21),
+                    "3M %": _return_pct(close, 63),
+                    "6M %": _return_pct(close, 126),
+                    "12M %": _return_pct(close, 252),
                 }
             )
         except Exception:
