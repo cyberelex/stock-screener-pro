@@ -1,5 +1,14 @@
 """Stock screening engine — fetches data from Yahoo Finance, computes
-fundamental + technical indicators, and applies user-defined filters."""
+fundamental + technical indicators, and applies user-defined filters.
+
+Known limits: all fundamentals come from yfinance's single point-in-time
+`.info` snapshot (today's numbers only). There is no multi-year statement
+history here (no revenue/margin/debt trend, just the latest figure), and
+no point-in-time historical fundamentals, which is why Backtest Lab can't
+properly replay fundamentals-driven presets (Long-Term Hold, Value
+Hunting, Dividend Income): it can only see today's balance sheet, not
+what it looked like on a rebalance date two years ago.
+"""
 
 from __future__ import annotations
 
@@ -113,7 +122,16 @@ UNIVERSES: dict[str, list[str]] = {
 
 
 def _normalize_dividend_yield(raw) -> float:
-    """Yahoo sometimes returns yield as a ratio (0.023) and sometimes as percent (2.3)."""
+    """Normalize Yahoo's dividendYield field to a plain percent (2.3 = 2.3%).
+
+    As of 2025 Yahoo returns this field already scaled as a percent (0.46
+    means 0.46%), not the pre-2025 ratio (0.023 meaning 2.3%). Verified by
+    cross-checking dividendRate / price against dividendYield across low-
+    and high-yield tickers. We no longer assume small values are ratios,
+    since that turned MSFT's real ~0.7% yield into a fake "74%". A high
+    sanity clamp guards against the field reverting to the old ratio
+    style without silently showing an absurd number.
+    """
     if raw is None:
         return 0.0
     try:
@@ -122,8 +140,8 @@ def _normalize_dividend_yield(raw) -> float:
         return 0.0
     if value <= 0:
         return 0.0
-    if value <= 1.0:
-        value *= 100
+    if value > 40:
+        value /= 100
     return round(value, 2)
 
 
@@ -225,6 +243,20 @@ def fetch_screening_data(
                     if info.get("profitMargins")
                     else None,
                     "Beta": info.get("beta"),
+                    "Debt/Equity %": info.get("debtToEquity"),
+                    "Current Ratio": info.get("currentRatio"),
+                    "ROE %": round(info.get("returnOnEquity", 0) * 100, 1)
+                    if info.get("returnOnEquity") is not None
+                    else None,
+                    "FCF Yield %": round(info.get("freeCashflow") / info.get("marketCap") * 100, 2)
+                    if info.get("freeCashflow") and info.get("marketCap")
+                    else None,
+                    "Payout Ratio %": round(info.get("payoutRatio", 0) * 100, 1)
+                    if info.get("payoutRatio") is not None
+                    else None,
+                    "PEG": info.get("trailingPegRatio")
+                    if info.get("trailingPegRatio") is not None
+                    else info.get("pegRatio"),
                     "52w High": info.get("fiftyTwoWeekHigh"),
                     "52w Low": info.get("fiftyTwoWeekLow"),
                     "50-day MA": round(ma50, 2) if not np.isnan(ma50) else None,
@@ -385,6 +417,8 @@ def adjust_preset_for_regime(preset: dict, regime: str) -> dict:
 KEEP_NA_FILTER_COLS = {
     "P/E", "Fwd P/E", "P/B", "Market Cap", "Div Yield %",
     "Revenue Growth %", "Profit Margin %", "EPS", "Beta",
+    "Debt/Equity %", "Current Ratio", "ROE %", "FCF Yield %",
+    "Payout Ratio %", "PEG",
 }
 
 
@@ -472,6 +506,16 @@ PRESETS: dict[str, dict] = {
     },
     "AI Momentum": {
         "pe": (0.0, 150.0),
+        "mktcap": "Any",
+        "div_min": 0.0,
+        "rsi": (0.0, 100.0),
+        "ma": "None",
+        "vol_spike": 0.0,
+        "pct_high": -80.0,
+        "sectors": None,
+    },
+    "Long-Term Hold": {
+        "pe": (5.0, 45.0),
         "mktcap": "Any",
         "div_min": 0.0,
         "rsi": (0.0, 100.0),
@@ -693,14 +737,235 @@ def compute_ai_setup_score(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def compute_lt_hold_score(df: pd.DataFrame) -> pd.DataFrame:
+    """Score each row 0–100 for long-term hold quality (any sector).
+
+    Points: scale 15, profitability 20, growth 15, valuation 15,
+    balance sheet quality 20, stability 15. Absolute checklist, not a
+    percentile rank. Uses Yahoo fundamentals only (see module docstring
+    limits: no multi-year statement history, no point-in-time backtesting).
+    """
+    out = pd.DataFrame(index=df.index)
+    if df.empty:
+        out["Hold Score"] = pd.Series(dtype=float)
+        out["Hold Tier"] = pd.Series(dtype=str)
+        out["Hold Note"] = pd.Series(dtype=str)
+        return out
+
+    def _col(name: str) -> pd.Series:
+        if name not in df.columns:
+            return pd.Series(np.nan, index=df.index)
+        return pd.to_numeric(df[name], errors="coerce")
+
+    sector = df.get("Sector", pd.Series("—", index=df.index))
+    if not isinstance(sector, pd.Series):
+        sector = pd.Series("—", index=df.index)
+    is_financial = sector.eq("Financial Services")
+
+    mktcap = _col("Market Cap")
+    scale_pts = np.select(
+        [mktcap >= 200_000_000_000, mktcap >= 10_000_000_000, mktcap >= 2_000_000_000],
+        [15, 11, 6],
+        default=0,
+    )
+
+    margin = _col("Profit Margin %")
+    margin_pts = np.select(
+        [margin >= 20, margin >= 15, margin >= 10, margin >= 5, margin > 0],
+        [12, 10, 7, 4, 2],
+        default=0,
+    )
+    roe = _col("ROE %")
+    roe_pts = np.select([roe >= 20, roe >= 15, roe >= 10, roe > 0], [8, 6, 4, 2], default=0)
+    profitability_pts = np.minimum(margin_pts + roe_pts, 20)
+
+    growth = _col("Revenue Growth %")
+    growth_pts = np.select(
+        [growth >= 15, growth >= 10, growth >= 5, growth >= 0],
+        [15, 12, 9, 5],
+        default=0,
+    )
+
+    pe = _col("P/E")
+    peg = _col("PEG")
+    pe_pts = np.select(
+        [
+            (pe >= 12) & (pe <= 25),
+            ((pe >= 8) & (pe < 12)) | ((pe > 25) & (pe <= 35)),
+            ((pe >= 5) & (pe < 8)) | ((pe > 35) & (pe <= 45)),
+        ],
+        [12, 8, 4],
+        default=2,
+    )
+    pe_pts = np.where(pe.isna() & (margin > 0), 4, pe_pts)
+    # PEG rewards growth that justifies the price, penalizes growth that
+    # doesn't. A 35 P/E growing 30%/yr should not score worse than a 20 P/E
+    # growing 2%/yr; a rich multiple with no growth to back it should.
+    peg_adj = np.select([peg <= 1.0, peg <= 2.0, peg > 3.0], [3, 1, -2], default=0)
+    val_pts = np.clip(pe_pts + peg_adj, 0, 15)
+
+    debt_eq = _col("Debt/Equity %")
+    current_ratio = _col("Current Ratio")
+    fcf_yield = _col("FCF Yield %")
+
+    # Debt/Equity isn't meaningful for banks/insurers (deposits and float
+    # look like "debt"); give them a neutral score instead of penalizing.
+    debt_pts = np.select(
+        [debt_eq <= 50, debt_eq <= 100, debt_eq <= 200],
+        [8, 5, 2],
+        default=0,
+    )
+    debt_pts = np.where(is_financial, 6, debt_pts)
+    debt_pts = np.where((~is_financial) & debt_eq.isna(), 3, debt_pts)
+
+    current_ratio_pts = np.select(
+        [current_ratio >= 2.0, current_ratio >= 1.5, current_ratio >= 1.0, current_ratio > 0],
+        [6, 5, 3, 1],
+        default=0,
+    )
+    current_ratio_pts = np.where(current_ratio.isna(), 3, current_ratio_pts)
+
+    fcf_pts = np.select(
+        [fcf_yield >= 8, fcf_yield >= 5, fcf_yield >= 2, fcf_yield > 0],
+        [6, 4, 2, 1],
+        default=0,
+    )
+    fcf_pts = np.where(fcf_yield.isna(), 2, fcf_pts)
+
+    balance_sheet_pts = np.minimum(debt_pts + current_ratio_pts + fcf_pts, 20)
+
+    beta = _col("Beta")
+    div = _col("Div Yield %")
+    payout = _col("Payout Ratio %")
+    above200 = df.get("Above 200-MA", False)
+    if not isinstance(above200, pd.Series):
+        above200 = pd.Series(False, index=df.index)
+    above200 = above200.fillna(False).astype(bool)
+
+    beta_pts = np.select([beta <= 1.0, beta <= 1.3], [6, 4], default=1)
+    # A yield only counts as "safe" if it's covered by earnings. Payout
+    # ratio over 100% means the dividend is being funded by debt/cash, not
+    # profit, a common precursor to a cut.
+    div_safety_pts = np.select(
+        [
+            (div >= 1.0) & (payout <= 60),
+            (div >= 1.0) & (payout <= 80),
+            (div >= 1.0) & (payout <= 100),
+            (div >= 1.0) & (payout > 100),
+        ],
+        [5, 3, 1, 0],
+        default=0,
+    )
+    div_safety_pts = np.where((div >= 1.0) & payout.isna(), 3, div_safety_pts)
+    trend_pts = np.where(above200, 4, 0)
+    stability_pts = np.minimum(beta_pts + div_safety_pts + trend_pts, 15)
+
+    total = (
+        pd.Series(scale_pts, index=df.index)
+        + pd.Series(profitability_pts, index=df.index)
+        + pd.Series(growth_pts, index=df.index)
+        + pd.Series(val_pts, index=df.index)
+        + pd.Series(balance_sheet_pts, index=df.index)
+        + pd.Series(stability_pts, index=df.index)
+    )
+    out["Hold Score"] = total.clip(0, 100).round(0)
+
+    out["Hold Tier"] = np.select(
+        [
+            out["Hold Score"] >= 75,
+            out["Hold Score"] >= 60,
+            out["Hold Score"] >= 45,
+        ],
+        ["Core", "Quality", "Watch"],
+        default="Pass",
+    )
+
+    notes: list[str] = []
+    for i in df.index:
+        bits: list[str] = []
+        mc_i = mktcap.loc[i] if i in mktcap.index else np.nan
+        if pd.notna(mc_i):
+            if mc_i >= 200_000_000_000:
+                bits.append("mega cap")
+            elif mc_i >= 10_000_000_000:
+                bits.append("large cap")
+            elif mc_i >= 2_000_000_000:
+                bits.append("mid cap")
+            else:
+                bits.append("small cap")
+
+        margin_i = margin.loc[i] if i in margin.index else np.nan
+        if pd.notna(margin_i):
+            if margin_i >= 15:
+                bits.append(f"margin {margin_i:.0f}% strong")
+            elif margin_i > 0:
+                bits.append(f"margin {margin_i:.0f}%")
+            else:
+                bits.append("unprofitable")
+
+        growth_i = growth.loc[i] if i in growth.index else np.nan
+        if pd.notna(growth_i):
+            bits.append(f"rev {growth_i:+.0f}%" if growth_i >= 0 else f"rev {growth_i:.0f}% shrink")
+
+        pe_i = pe.loc[i] if i in pe.index else np.nan
+        if pd.notna(pe_i):
+            if 12 <= pe_i <= 25:
+                bits.append(f"P/E {pe_i:.0f} fair")
+            elif pe_i > 35:
+                bits.append(f"P/E {pe_i:.0f} rich")
+            else:
+                bits.append(f"P/E {pe_i:.0f}")
+
+        peg_i = peg.loc[i] if i in peg.index else np.nan
+        if pd.notna(peg_i):
+            if peg_i <= 1.0:
+                bits.append(f"PEG {peg_i:.1f} cheap for growth")
+            elif peg_i > 3.0:
+                bits.append(f"PEG {peg_i:.1f} rich for growth")
+
+        debt_i = debt_eq.loc[i] if i in debt_eq.index else np.nan
+        if bool(is_financial.loc[i]):
+            pass
+        elif pd.isna(debt_i):
+            bits.append("debt unknown")
+        elif debt_i <= 50:
+            bits.append("low debt")
+        elif debt_i > 150:
+            bits.append(f"debt/equity {debt_i:.0f}% high")
+
+        roe_i = roe.loc[i] if i in roe.index else np.nan
+        if pd.notna(roe_i) and roe_i >= 15:
+            bits.append(f"ROE {roe_i:.0f}% strong")
+
+        if bool(above200.loc[i]):
+            bits.append("above 200-day")
+        else:
+            bits.append("below 200-day")
+
+        div_i = div.loc[i] if i in div.index else np.nan
+        payout_i = payout.loc[i] if i in payout.index else np.nan
+        if pd.notna(div_i) and div_i >= 1.0:
+            if pd.notna(payout_i) and payout_i > 100:
+                bits.append(f"yield {div_i:.1f}% payout {payout_i:.0f}% unsustainable")
+            else:
+                bits.append(f"yield {div_i:.1f}%")
+
+        notes.append(" · ".join(bits))
+
+    out["Hold Note"] = notes
+    return out
+
+
 def compute_score(df: pd.DataFrame, preset: str) -> pd.Series:
     """Return a 0–100 composite score for each row based on *preset* weights.
 
-    AI Momentum uses an absolute setup checklist. Other presets use percentile
-    ranks within the filtered set. Missing values get 50th-percentile (neutral).
+    AI Momentum and Long-Term Hold use absolute checklists. Other presets use
+    percentile ranks within the filtered set. Missing values get 50th-percentile.
     """
     if preset == "AI Momentum":
         return compute_ai_setup_score(df)["Setup Score"]
+    if preset == "Long-Term Hold":
+        return compute_lt_hold_score(df)["Hold Score"]
 
     weights = SCORE_WEIGHTS.get(preset, SCORE_WEIGHTS["No Preset"])
     total_weight = sum(w for _, w, _ in weights)

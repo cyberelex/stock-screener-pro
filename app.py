@@ -8,7 +8,8 @@ import yfinance as yf
 
 from screener import (
     SP500_TICKERS, UNIVERSES, AI_SLEEVE_ORDER, fetch_screening_data,
-    apply_filters, compute_score, compute_ai_setup_score, detect_regime,
+    apply_filters, compute_score, compute_ai_setup_score, compute_lt_hold_score,
+    detect_regime,
     adjust_preset_for_regime, PRESETS, ALL_MA_OPTIONS, MARKET_CAP_BOUNDS,
 )
 from database import (
@@ -108,6 +109,23 @@ st.caption("Yahoo Finance data · Fundamentals + Technicals")
 
 # ── Sidebar: data loading ─────────────────────────────────────────────────
 with st.sidebar:
+    st.header("Mode")
+    mode = st.radio(
+        "What are you doing?",
+        ["Timing", "Discovery"],
+        horizontal=True,
+        help=(
+            "Timing: momentum and entry tools (AI Momentum, Momentum/Growth, "
+            "Oversold Bounce, Paper Trading, Backtest Lab, You vs Bot). "
+            "Discovery: quality long-term-hold screening (Long-Term Hold, "
+            "Value Hunting, Dividend Income). No trading tools shown here."
+        ),
+    )
+    st.caption(
+        "**Timing** — when to buy or sell." if mode == "Timing"
+        else "**Discovery** — is this a durable business worth holding for years."
+    )
+    st.divider()
     st.header("Universe")
 
     universe_label = st.selectbox(
@@ -213,12 +231,27 @@ PRESET_DESCRIPTIONS = {
         "200-day, RSI 50–70, beating or keeping up with NVDA, near the 52-week high, "
         "and green on the week and month. Score is a 0–100 checklist, not a relative rank. "
         "Ideal 80+, Good 60–79, Mixed 40–59, Weak below 40.",
+    "Long-Term Hold": "Discovers durable businesses for multi-year holds (any sector). "
+        "Scores scale, profitability (margin + ROE), growth (revenue + PEG), valuation "
+        "(P/E band), balance-sheet quality (debt/equity, current ratio, FCF yield), and "
+        "stability (dividend safety via payout ratio, beta, 200-day trend). "
+        "Core 75+, Quality 60–74, Watch 45–59, Pass below 45. "
+        "Load **S&P 500 + Mid-Caps** or **All Universes** for broad discovery. "
+        "This is a quality screen, not a timing tool: use AI Momentum or the 50-day "
+        "line for when to buy. Still Yahoo-fundamentals-only: no multi-year statement "
+        "history and Backtest Lab can't replay it (see Discovery mode caption).",
 }
+
+TIMING_PRESETS = ["No Preset", "AI Momentum", "Momentum / Growth", "Oversold Bounce"]
+DISCOVERY_PRESETS = ["No Preset", "Long-Term Hold", "Value Hunting", "Dividend Income"]
 
 with st.sidebar:
     st.divider()
     st.header("Strategy Preset")
-    preset_name = st.selectbox("Apply a preset", list(PRESETS.keys()))
+    preset_options = TIMING_PRESETS if mode == "Timing" else DISCOVERY_PRESETS
+    preset_name = st.selectbox(
+        "Apply a preset", preset_options, key=f"preset_select_{mode}"
+    )
     p = adjust_preset_for_regime(PRESETS[preset_name], regime)
 
     st.info(PRESET_DESCRIPTIONS.get(preset_name, ""))
@@ -317,6 +350,11 @@ if not filtered.empty:
         filtered["Score"] = setup["Setup Score"]
         filtered["Setup"] = setup["Setup"]
         filtered["Setup Note"] = setup["Setup Note"]
+    elif preset_name == "Long-Term Hold":
+        hold = compute_lt_hold_score(filtered)
+        filtered["Score"] = hold["Hold Score"]
+        filtered["Setup"] = hold["Hold Tier"]
+        filtered["Setup Note"] = hold["Hold Note"]
     else:
         filtered["Score"] = compute_score(filtered, preset_name)
     filtered = filtered.sort_values("Score", ascending=False).reset_index(drop=True)
@@ -332,10 +370,16 @@ c5.metric("Avg Div Yield", f"{filtered['Div Yield %'].mean():.2f}%" if filtered[
 st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────
-tab_table, tab_watch, tab_charts, tab_detail, tab_paper, tab_backtest, tab_vs = st.tabs(
-    ["Screener Results", "My Watchlist", "Charts", "Stock Detail",
-     "Paper Trading", "Backtest Lab", "You vs Bot"]
-)
+if mode == "Discovery":
+    tab_table, tab_watch, tab_charts, tab_detail = st.tabs(
+        ["Screener Results", "My Watchlist", "Charts", "Stock Detail"]
+    )
+    tab_paper = tab_backtest = tab_vs = None
+else:
+    tab_table, tab_watch, tab_charts, tab_detail, tab_paper, tab_backtest, tab_vs = st.tabs(
+        ["Screener Results", "My Watchlist", "Charts", "Stock Detail",
+         "Paper Trading", "Backtest Lab", "You vs Bot"]
+    )
 
 with tab_table:
     ai_watch = df[df["AI Sleeve"].isin(["Chips", "Infra", "Software"])].copy()
@@ -432,11 +476,30 @@ with tab_table:
         "RSI (14)", "50-day MA", "200-day MA", "Vol vs Avg", "% from 52w High", "Beta",
         "Setup Note",
     ]
+    if preset_name == "Long-Term Hold":
+        # Surface the balance-sheet/quality fields that actually drive this
+        # score, right after the metrics they extend.
+        display_cols[display_cols.index("Beta") + 1:display_cols.index("Beta") + 1] = [
+            "PEG", "Debt/Equity %", "Current Ratio", "ROE %", "FCF Yield %", "Payout Ratio %",
+        ]
     show_cols = [c for c in display_cols if c in filtered.columns]
 
     display_df = filtered[show_cols].copy()
     display_df["Market Cap"] = (display_df["Market Cap"] / 1e9).round(1)
     display_df = display_df.rename(columns={"Market Cap": "Mkt Cap ($B)"})
+
+    if preset_name == "Long-Term Hold":
+        score_help = "0–100 hold-quality checklist: scale, margins, growth, valuation, stability."
+        setup_help = "Core 75+ · Quality 60–74 · Watch 45–59 · Pass below 45."
+        note_help = "Why it scored here on fundamentals and trend."
+    elif preset_name == "AI Momentum":
+        score_help = "0–100 ideal-setup checklist (trend, RSI, vs NVDA, near high, 1W/1M)."
+        setup_help = "Ideal 80+ · Good 60–79 · Mixed 40–59 · Weak below 40."
+        note_help = "Why the AI setup score landed here."
+    else:
+        score_help = "Relative rank within the current filtered list (not an absolute grade)."
+        setup_help = "Tier labels apply to AI Momentum and Long-Term Hold presets only."
+        note_help = "Setup notes apply to AI Momentum and Long-Term Hold presets only."
 
     st.dataframe(
         display_df.reset_index(drop=True),
@@ -445,13 +508,13 @@ with tab_table:
         column_config={
             "Score": st.column_config.ProgressColumn(
                 "Score", min_value=0, max_value=100, format="%.0f",
-                help="For AI Momentum: 0–100 ideal-setup checklist. Other presets: relative rank in the current list.",
+                help=score_help,
             ),
             "Setup": st.column_config.TextColumn(
-                help="Ideal 80+ · Good 60–79 · Mixed 40–59 · Weak below 40.",
+                help=setup_help,
             ),
             "Setup Note": st.column_config.TextColumn(
-                help="Why the AI setup score landed here.",
+                help=note_help,
                 width="large",
             ),
             "Ticker": st.column_config.TextColumn(
@@ -507,6 +570,30 @@ with tab_table:
             ),
             "Beta": st.column_config.NumberColumn(
                 help="Volatility relative to the market. 1.0 = moves with the market. Above 1.5 = significantly more volatile. Below 0.8 = defensive.",
+            ),
+            "PEG": st.column_config.NumberColumn(
+                format="%.2f",
+                help="P/E divided by earnings growth. Below 1.0 = cheap relative to growth. Above 3.0 = expensive relative to growth.",
+            ),
+            "Debt/Equity %": st.column_config.NumberColumn(
+                format="%.0f%%",
+                help="Total debt as a % of shareholder equity. Below 50% = low leverage. Above 200% = highly levered. Not meaningful for banks/insurers.",
+            ),
+            "Current Ratio": st.column_config.NumberColumn(
+                format="%.2f",
+                help="Current assets divided by current liabilities. Above 1.5 = comfortable short-term liquidity. Below 1.0 = potential cash crunch risk.",
+            ),
+            "ROE %": st.column_config.NumberColumn(
+                format="%.1f%%",
+                help="Return on Equity. Net income as a % of shareholder equity. Above 15% is strong capital efficiency.",
+            ),
+            "FCF Yield %": st.column_config.NumberColumn(
+                format="%.2f%%",
+                help="Free cash flow as a % of market cap. Higher = more real cash generation per dollar of valuation. Harder to fake than earnings.",
+            ),
+            "Payout Ratio %": st.column_config.NumberColumn(
+                format="%.0f%%",
+                help="% of earnings paid out as dividends. Above 100% means the dividend isn't covered by profit, a common precursor to a cut.",
             ),
             "AI Sleeve": st.column_config.TextColumn(
                 help="AI stack role: Chips, Infra (data centers/power), Software, or — if not tagged.",
@@ -577,7 +664,7 @@ with tab_table:
                 st.caption("Opens on the My Watchlist tab")
 
     # ── Quick Buy from screener ───────────────────────────────────────
-    if not filtered.empty:
+    if mode == "Timing" and not filtered.empty:
         st.divider()
         trading_ok_scr, trading_msg_scr = is_trading_allowed()
 
@@ -806,427 +893,430 @@ with tab_detail:
             rc6.metric("12M", _ret("12M %"))
 
 # ── Paper Trading tab ─────────────────────────────────────────────────────
-with tab_paper:
-    st.subheader("Paper Trading")
-    st.caption(
-        "Practice trading with $100k virtual cash. Picks from your screener results. "
-        "On Streamlit Community Cloud the local database resets when the app reboots."
-    )
+if mode == "Timing":
+    with tab_paper:
+        st.subheader("Paper Trading")
+        st.caption(
+            "Practice trading with $100k virtual cash. Picks from your screener results. "
+            "On Streamlit Community Cloud the local database resets when the app reboots."
+        )
 
-    trading_allowed, trading_msg = is_trading_allowed()
-    challenge = get_active_challenge()
+        trading_allowed, trading_msg = is_trading_allowed()
+        challenge = get_active_challenge()
 
-    if challenge and challenge["status"] == "locked":
-        st.warning(f"Portfolios are **locked**. {trading_msg}")
-    elif challenge and challenge["status"] == "active":
-        st.success(f"Challenge active: **{challenge['name']}** — {trading_msg}")
+        if challenge and challenge["status"] == "locked":
+            st.warning(f"Portfolios are **locked**. {trading_msg}")
+        elif challenge and challenge["status"] == "active":
+            st.success(f"Challenge active: **{challenge['name']}** — {trading_msg}")
 
-    manual_pid = get_or_create_portfolio("My Portfolio", ptype="manual")
-    manual_port = get_portfolio(manual_pid)
+        manual_pid = get_or_create_portfolio("My Portfolio", ptype="manual")
+        manual_port = get_portfolio(manual_pid)
 
-    pc1, pc2, pc3 = st.columns(3)
-    holdings_raw = get_holdings(manual_pid)
-    if not holdings_raw.empty:
-        holdings_enriched = enrich_holdings_with_prices(holdings_raw)
-        market_val = holdings_enriched["Market Value"].sum()
-    else:
-        holdings_enriched = holdings_raw
-        market_val = 0
-
-    total_val = manual_port["cash"] + market_val
-    total_pnl = total_val - manual_port["starting_cash"]
-    total_pnl_pct = (total_pnl / manual_port["starting_cash"]) * 100
-
-    pc1.metric("Cash", f"${manual_port['cash']:,.2f}")
-    pc2.metric("Portfolio Value", f"${total_val:,.2f}")
-    pc3.metric("Total P&L", f"${total_pnl:,.2f} ({total_pnl_pct:+.1f}%)")
-
-    st.divider()
-
-    trade_col, holdings_col = st.columns([1, 2])
-
-    with trade_col:
-        st.markdown("**Place a Trade**")
-        if not trading_allowed:
-            st.info("Trading is locked during the hold period. Check the You vs Bot tab for standings.")
-        elif filtered.empty:
-            st.info("Run the screener first to populate the ticker list.")
-            available_tickers = []
+        pc1, pc2, pc3 = st.columns(3)
+        holdings_raw = get_holdings(manual_pid)
+        if not holdings_raw.empty:
+            holdings_enriched = enrich_holdings_with_prices(holdings_raw)
+            market_val = holdings_enriched["Market Value"].sum()
         else:
-            available_tickers = filtered["Ticker"].tolist()
+            holdings_enriched = holdings_raw
+            market_val = 0
 
-        if trading_allowed and available_tickers:
-            trade_ticker = st.selectbox("Ticker", available_tickers, key="trade_ticker")
-            trade_side = st.radio("Side", ["buy", "sell"], horizontal=True, key="trade_side")
+        total_val = manual_port["cash"] + market_val
+        total_pnl = total_val - manual_port["starting_cash"]
+        total_pnl_pct = (total_pnl / manual_port["starting_cash"]) * 100
 
-            if trade_ticker:
-                try:
-                    live_price = yf.Ticker(trade_ticker).info.get("currentPrice") or \
-                                 yf.Ticker(trade_ticker).history(period="1d")["Close"].iloc[-1]
-                except Exception:
-                    live_price = filtered.loc[filtered["Ticker"] == trade_ticker, "Price"].iloc[0]
-                st.caption(f"Current price: **${live_price:.2f}**")
+        pc1.metric("Cash", f"${manual_port['cash']:,.2f}")
+        pc2.metric("Portfolio Value", f"${total_val:,.2f}")
+        pc3.metric("Total P&L", f"${total_pnl:,.2f} ({total_pnl_pct:+.1f}%)")
 
-            trade_shares = st.number_input("Shares", min_value=0.01, value=10.0, step=1.0, key="trade_shares")
+        st.divider()
 
-            if trade_side == "buy":
-                cost_preview = trade_shares * live_price
-                st.caption(f"Estimated cost: ${cost_preview:,.2f}")
+        trade_col, holdings_col = st.columns([1, 2])
 
-            if st.button("Execute Trade", type="primary", key="exec_trade"):
-                err = execute_trade(manual_pid, trade_ticker, trade_side,
-                                    trade_shares, live_price, reason="Manual trade")
-                if err:
-                    st.error(err)
-                else:
-                    snapshot_portfolio(manual_pid)
-                    st.success(f"{'Bought' if trade_side == 'buy' else 'Sold'} "
-                               f"{trade_shares:.2f} shares of {trade_ticker} @ ${live_price:.2f}")
-                    st.rerun()
+        with trade_col:
+            st.markdown("**Place a Trade**")
+            if not trading_allowed:
+                st.info("Trading is locked during the hold period. Check the You vs Bot tab for standings.")
+            elif filtered.empty:
+                st.info("Run the screener first to populate the ticker list.")
+                available_tickers = []
+            else:
+                available_tickers = filtered["Ticker"].tolist()
 
-    with holdings_col:
-        st.markdown("**Current Holdings**")
-        if holdings_enriched.empty:
-            st.info("No holdings yet. Buy some stocks!")
+            if trading_allowed and available_tickers:
+                trade_ticker = st.selectbox("Ticker", available_tickers, key="trade_ticker")
+                trade_side = st.radio("Side", ["buy", "sell"], horizontal=True, key="trade_side")
+
+                if trade_ticker:
+                    try:
+                        live_price = yf.Ticker(trade_ticker).info.get("currentPrice") or \
+                                     yf.Ticker(trade_ticker).history(period="1d")["Close"].iloc[-1]
+                    except Exception:
+                        live_price = filtered.loc[filtered["Ticker"] == trade_ticker, "Price"].iloc[0]
+                    st.caption(f"Current price: **${live_price:.2f}**")
+
+                trade_shares = st.number_input("Shares", min_value=0.01, value=10.0, step=1.0, key="trade_shares")
+
+                if trade_side == "buy":
+                    cost_preview = trade_shares * live_price
+                    st.caption(f"Estimated cost: ${cost_preview:,.2f}")
+
+                if st.button("Execute Trade", type="primary", key="exec_trade"):
+                    err = execute_trade(manual_pid, trade_ticker, trade_side,
+                                        trade_shares, live_price, reason="Manual trade")
+                    if err:
+                        st.error(err)
+                    else:
+                        snapshot_portfolio(manual_pid)
+                        st.success(f"{'Bought' if trade_side == 'buy' else 'Sold'} "
+                                   f"{trade_shares:.2f} shares of {trade_ticker} @ ${live_price:.2f}")
+                        st.rerun()
+
+        with holdings_col:
+            st.markdown("**Current Holdings**")
+            if holdings_enriched.empty:
+                st.info("No holdings yet. Buy some stocks!")
+            else:
+                st.dataframe(
+                    holdings_enriched.reset_index(drop=True),
+                    use_container_width=True,
+                    height=300,
+                    column_config={
+                        "P&L ($)": st.column_config.NumberColumn(format="$%.2f"),
+                        "P&L (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Market Value": st.column_config.NumberColumn(format="$%.2f"),
+                        "Current Price": st.column_config.NumberColumn(format="$%.2f"),
+                        "Avg Cost": st.column_config.NumberColumn(format="$%.2f"),
+                    },
+                )
+
+        st.divider()
+        st.markdown("**Trade Log**")
+        trade_log = get_trade_log(manual_pid)
+        if trade_log.empty:
+            st.caption("No trades yet.")
         else:
-            st.dataframe(
-                holdings_enriched.reset_index(drop=True),
-                use_container_width=True,
-                height=300,
-                column_config={
-                    "P&L ($)": st.column_config.NumberColumn(format="$%.2f"),
-                    "P&L (%)": st.column_config.NumberColumn(format="%.1f%%"),
-                    "Market Value": st.column_config.NumberColumn(format="$%.2f"),
-                    "Current Price": st.column_config.NumberColumn(format="$%.2f"),
-                    "Avg Cost": st.column_config.NumberColumn(format="$%.2f"),
-                },
-            )
+            st.dataframe(trade_log, use_container_width=True, height=300)
 
-    st.divider()
-    st.markdown("**Trade Log**")
-    trade_log = get_trade_log(manual_pid)
-    if trade_log.empty:
-        st.caption("No trades yet.")
-    else:
-        st.dataframe(trade_log, use_container_width=True, height=300)
-
-    st.divider()
-    if st.button("Reset Portfolio", type="secondary", key="reset_manual"):
-        reset_portfolio(manual_pid)
-        st.success("Portfolio reset to $100k cash. All trades cleared.")
-        st.rerun()
+        st.divider()
+        if st.button("Reset Portfolio", type="secondary", key="reset_manual"):
+            reset_portfolio(manual_pid)
+            st.success("Portfolio reset to $100k cash. All trades cleared.")
+            st.rerun()
 
 
 # ── Backtest Lab tab ──────────────────────────────────────────────────────
-with tab_backtest:
-    st.subheader("Backtest Lab")
-    st.caption(
-        "Price-only replay: RSI, trend, drawdown, and volume. "
-        "Live P/E, yield, and growth are not available historically, so Value Hunting "
-        "and Dividend Income here are technical approximations, not the live screener. "
-        "AI Momentum uses the same setup checklist (trend, RSI, vs NVDA, near high, 1W/1M)."
-    )
-
-    bc1, bc2, bc3, bc4 = st.columns(4)
-    with bc1:
-        bt_preset = st.selectbox("Strategy", list(PRESETS.keys()), key="bt_preset")
-    with bc2:
-        bt_topn = st.slider("Top N stocks to hold", 3, 30, 10, key="bt_topn")
-    with bc3:
-        bt_rebal = st.selectbox("Rebalance", ["monthly", "weekly"], key="bt_rebal")
-    with bc4:
-        bt_years = st.slider("Lookback (years)", 1, 5, 2, key="bt_years")
-
-    bt_tickers = selected_tickers or SP500_TICKERS
-
-    if st.button("Run Backtest", type="primary", key="run_bt"):
-        with st.spinner("Running backtest... this may take a few minutes for large universes."):
-            bar = st.progress(0, text="Starting backtest...")
-            results = run_backtest(
-                tickers=bt_tickers,
-                preset=bt_preset,
-                top_n=bt_topn,
-                rebalance_freq=bt_rebal,
-                lookback_years=bt_years,
-                progress_callback=bar.progress,
-            )
-            bar.empty()
-
-        if results["equity_curve"].empty:
-            st.warning("Not enough data to run the backtest. Try fewer tickers or shorter lookback.")
-        else:
-            st.session_state["bt_results"] = results
-
-    if "bt_results" in st.session_state:
-        results = st.session_state["bt_results"]
-        ec = results["equity_curve"]
-        stats = results["stats"]
-
-        st.markdown("### Performance Summary")
-        sc1, sc2, sc3, sc4, sc5 = st.columns(5)
-        sc1.metric("Total Return", stats.get("Total Return", "—"))
-        sc2.metric("Benchmark (SPY)", stats.get("Benchmark Return", "—"))
-        sc3.metric("Max Drawdown", stats.get("Max Drawdown", "—"))
-        sc4.metric("Sharpe Ratio", stats.get("Sharpe Ratio", "—"))
-        sc5.metric("Final Value", stats.get("Final Value", "—"))
-
-        sc6, sc7, sc8 = st.columns(3)
-        sc6.metric("Annualized Return", stats.get("Annualized Return", "—"))
-        sc7.metric("Win Rate", stats.get("Win Rate", "—"))
-        sc8.metric("Total Trades", stats.get("Total Trades", "—"))
-
-        if results.get("note"):
-            st.info(results["note"])
-
-        st.markdown("### Equity Curve")
-        fig_eq = go.Figure()
-        fig_eq.add_trace(go.Scatter(
-            x=ec["Date"], y=ec["Portfolio"], mode="lines",
-            name="Your Strategy", line=dict(color="#4F8BF9", width=2),
-        ))
-        fig_eq.add_trace(go.Scatter(
-            x=ec["Date"], y=ec["Benchmark"], mode="lines",
-            name="SPY Benchmark", line=dict(color="#9CA3AF", width=1.5, dash="dash"),
-        ))
-        fig_eq.update_layout(
-            height=450, margin=dict(t=20, b=20),
-            yaxis_title="Portfolio Value ($)",
-            hovermode="x unified",
-            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
+if mode == "Timing":
+    with tab_backtest:
+        st.subheader("Backtest Lab")
+        st.caption(
+            "Price-only replay: RSI, trend, drawdown, and volume. "
+            "Live P/E, yield, and growth are not available historically, so Value Hunting "
+            "and Dividend Income here are technical approximations, not the live screener. "
+            "AI Momentum uses the same setup checklist (trend, RSI, vs NVDA, near high, 1W/1M)."
         )
-        st.plotly_chart(fig_eq, use_container_width=True)
 
-        st.markdown("### Backtest Trades")
-        bt_trades_df = pd.DataFrame(results["trades"])
-        if not bt_trades_df.empty:
-            st.dataframe(bt_trades_df, use_container_width=True, height=300)
-        else:
-            st.caption("No trades generated.")
+        bc1, bc2, bc3, bc4 = st.columns(4)
+        with bc1:
+            bt_preset = st.selectbox("Strategy", list(PRESETS.keys()), key="bt_preset")
+        with bc2:
+            bt_topn = st.slider("Top N stocks to hold", 3, 30, 10, key="bt_topn")
+        with bc3:
+            bt_rebal = st.selectbox("Rebalance", ["monthly", "weekly"], key="bt_rebal")
+        with bc4:
+            bt_years = st.slider("Lookback (years)", 1, 5, 2, key="bt_years")
+
+        bt_tickers = selected_tickers or SP500_TICKERS
+
+        if st.button("Run Backtest", type="primary", key="run_bt"):
+            with st.spinner("Running backtest... this may take a few minutes for large universes."):
+                bar = st.progress(0, text="Starting backtest...")
+                results = run_backtest(
+                    tickers=bt_tickers,
+                    preset=bt_preset,
+                    top_n=bt_topn,
+                    rebalance_freq=bt_rebal,
+                    lookback_years=bt_years,
+                    progress_callback=bar.progress,
+                )
+                bar.empty()
+
+            if results["equity_curve"].empty:
+                st.warning("Not enough data to run the backtest. Try fewer tickers or shorter lookback.")
+            else:
+                st.session_state["bt_results"] = results
+
+        if "bt_results" in st.session_state:
+            results = st.session_state["bt_results"]
+            ec = results["equity_curve"]
+            stats = results["stats"]
+
+            st.markdown("### Performance Summary")
+            sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+            sc1.metric("Total Return", stats.get("Total Return", "—"))
+            sc2.metric("Benchmark (SPY)", stats.get("Benchmark Return", "—"))
+            sc3.metric("Max Drawdown", stats.get("Max Drawdown", "—"))
+            sc4.metric("Sharpe Ratio", stats.get("Sharpe Ratio", "—"))
+            sc5.metric("Final Value", stats.get("Final Value", "—"))
+
+            sc6, sc7, sc8 = st.columns(3)
+            sc6.metric("Annualized Return", stats.get("Annualized Return", "—"))
+            sc7.metric("Win Rate", stats.get("Win Rate", "—"))
+            sc8.metric("Total Trades", stats.get("Total Trades", "—"))
+
+            if results.get("note"):
+                st.info(results["note"])
+
+            st.markdown("### Equity Curve")
+            fig_eq = go.Figure()
+            fig_eq.add_trace(go.Scatter(
+                x=ec["Date"], y=ec["Portfolio"], mode="lines",
+                name="Your Strategy", line=dict(color="#4F8BF9", width=2),
+            ))
+            fig_eq.add_trace(go.Scatter(
+                x=ec["Date"], y=ec["Benchmark"], mode="lines",
+                name="SPY Benchmark", line=dict(color="#9CA3AF", width=1.5, dash="dash"),
+            ))
+            fig_eq.update_layout(
+                height=450, margin=dict(t=20, b=20),
+                yaxis_title="Portfolio Value ($)",
+                hovermode="x unified",
+                legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
+            )
+            st.plotly_chart(fig_eq, use_container_width=True)
+
+            st.markdown("### Backtest Trades")
+            bt_trades_df = pd.DataFrame(results["trades"])
+            if not bt_trades_df.empty:
+                st.dataframe(bt_trades_df, use_container_width=True, height=300)
+            else:
+                st.caption("No trades generated.")
 
 
 # ── You vs Bot tab ────────────────────────────────────────────────────────
-with tab_vs:
-    st.subheader("You vs Bot")
-    st.caption("The bot runs its own portfolio using the screener's top picks. Compare your manual trades against the algorithm.")
+if mode == "Timing":
+    with tab_vs:
+        st.subheader("You vs Bot")
+        st.caption("The bot runs its own portfolio using the screener's top picks. Compare your manual trades against the algorithm.")
 
-    challenge_vs = get_active_challenge()
-    trading_ok, trading_reason = is_trading_allowed()
+        challenge_vs = get_active_challenge()
+        trading_ok, trading_reason = is_trading_allowed()
 
-    # ── Challenge banner ──────────────────────────────────────────────
-    if challenge_vs:
-        from datetime import date as _date
-        ch = challenge_vs
-        if ch["status"] == "active":
-            days_trade = (_date.fromisoformat(ch["trade_end"]) - _date.today()).days
-            days_total = (_date.fromisoformat(ch["challenge_end"]) - _date.today()).days
-            st.success(
-                f"**{ch['name']}** — Trading window open. "
-                f"**{days_trade} day(s)** left to make your picks, "
-                f"then portfolios lock for {days_total - days_trade} more days."
-            )
-        elif ch["status"] == "locked":
-            days_left = (_date.fromisoformat(ch["challenge_end"]) - _date.today()).days
-            st.warning(
-                f"**{ch['name']}** — Portfolios are **locked**. "
-                f"**{days_left} day(s)** until the challenge ends. "
-                "Just open the app to record daily snapshots."
-            )
-        elif ch["status"] == "completed":
-            if ch.get("winner") == "Cancelled":
-                st.info(f"**{ch['name']}** was cancelled.")
-            else:
-                st.balloons()
-                st.success(f"**{ch['name']}** is over! Winner: **{ch.get('winner', '—')}**")
-
-        if ch["status"] in ("active", "locked"):
-            if st.button("Cancel Challenge", type="secondary", key="cancel_challenge"):
-                cancel_challenge(ch["id"])
-                st.success("Challenge cancelled. Free trading restored.")
-                st.rerun()
-
-    # ── Start a new challenge ─────────────────────────────────────────
-    if not challenge_vs or challenge_vs["status"] == "completed":
-        with st.expander("Start a New Challenge", expanded=not bool(challenge_vs)):
-            st.markdown(
-                "Set a **trading window** to pick your stocks, then a **hold period** "
-                "where portfolios lock and the market decides the winner."
-            )
-            ch_col1, ch_col2, ch_col3, ch_col4 = st.columns(4)
-            with ch_col1:
-                ch_name = st.text_input("Challenge name", value="Week 1 Challenge", key="ch_name")
-            with ch_col2:
-                ch_trade_days = st.number_input("Trading window (days)", 1, 14, 5, key="ch_trade_days")
-            with ch_col3:
-                ch_hold_days = st.number_input("Hold period (days)", 7, 90, 21, key="ch_hold_days")
-            with ch_col4:
-                ch_cash = st.number_input("Starting cash ($)", 10_000, 1_000_000, 100_000,
-                                          step=10_000, key="ch_cash")
-
-            st.caption(
-                f"You and the bot each get **${ch_cash:,.0f}**. "
-                f"Trade for **{ch_trade_days} days**, then hold for **{ch_hold_days} days**. "
-                f"Total challenge: **{ch_trade_days + ch_hold_days} days**."
-            )
-
-            if st.button("Start Challenge", type="primary", key="start_challenge"):
-                create_challenge(ch_name, ch_trade_days, ch_hold_days, ch_cash)
-                st.success(f"Challenge **{ch_name}** started! Both portfolios reset to ${ch_cash:,.0f}. Go make your picks!")
-                st.rerun()
-
-    st.divider()
-
-    # ── Bot controls ──────────────────────────────────────────────────
-    vs_col1, vs_col2 = st.columns(2)
-
-    strategy_options = ["Auto (Best Fit)"] + list(PRESETS.keys())
-    with vs_col1:
-        bot_preset_vs = st.selectbox("Bot Strategy", strategy_options,
-                                     index=0, key="bot_strategy_vs")
-        bot_topn_vs = st.slider("Bot top N holdings", 3, 20, 10, key="bot_topn_vs")
-
-    if bot_preset_vs == "Auto (Best Fit)" and not df.empty:
-        auto_result = auto_select_strategy(df)
-        st.info(auto_result["reasoning"])
-        effective_preset = auto_result["preset"]
-    else:
-        effective_preset = bot_preset_vs if bot_preset_vs != "Auto (Best Fit)" else "No Preset"
-
-    with vs_col2:
-        st.markdown(" ")
-        st.markdown(" ")
-        if not trading_ok:
-            st.info("Bot trading is locked during the hold period.")
-        elif st.button("Run Bot Rebalance Now", type="primary", key="run_bot"):
-            if df.empty:
-                st.warning("Load screener data first.")
-            else:
-                with st.spinner("Bot is trading..."):
-                    result = bot_rebalance(
-                        screener_df=df,
-                        preset=effective_preset,
-                        top_n=bot_topn_vs,
-                    )
-                if "error" in result:
-                    st.error(result["error"])
+        # ── Challenge banner ──────────────────────────────────────────────
+        if challenge_vs:
+            from datetime import date as _date
+            ch = challenge_vs
+            if ch["status"] == "active":
+                days_trade = (_date.fromisoformat(ch["trade_end"]) - _date.today()).days
+                days_total = (_date.fromisoformat(ch["challenge_end"]) - _date.today()).days
+                st.success(
+                    f"**{ch['name']}** — Trading window open. "
+                    f"**{days_trade} day(s)** left to make your picks, "
+                    f"then portfolios lock for {days_total - days_trade} more days."
+                )
+            elif ch["status"] == "locked":
+                days_left = (_date.fromisoformat(ch["challenge_end"]) - _date.today()).days
+                st.warning(
+                    f"**{ch['name']}** — Portfolios are **locked**. "
+                    f"**{days_left} day(s)** until the challenge ends. "
+                    "Just open the app to record daily snapshots."
+                )
+            elif ch["status"] == "completed":
+                if ch.get("winner") == "Cancelled":
+                    st.info(f"**{ch['name']}** was cancelled.")
                 else:
-                    st.success(
-                        f"Bot chose **{effective_preset}** — "
-                        f"{len(result['buys'])} buys, "
-                        f"{len(result['sells'])} sells. "
-                        f"Portfolio: ${result['portfolio_value']:,.2f}"
-                    )
+                    st.balloons()
+                    st.success(f"**{ch['name']}** is over! Winner: **{ch.get('winner', '—')}**")
+
+            if ch["status"] in ("active", "locked"):
+                if st.button("Cancel Challenge", type="secondary", key="cancel_challenge"):
+                    cancel_challenge(ch["id"])
+                    st.success("Challenge cancelled. Free trading restored.")
                     st.rerun()
 
-    st.divider()
-
-    # ── Head-to-head comparison ───────────────────────────────────────
-    manual_pid_vs = get_or_create_portfolio("My Portfolio", ptype="manual")
-    manual_port_vs = get_portfolio(manual_pid_vs)
-    bot_status = get_bot_status("Robo Bot")
-
-    manual_holdings = get_holdings(manual_pid_vs)
-    if not manual_holdings.empty:
-        manual_holdings = enrich_holdings_with_prices(manual_holdings)
-        manual_mkt = manual_holdings["Market Value"].sum()
-    else:
-        manual_mkt = 0
-    manual_total = manual_port_vs["cash"] + manual_mkt
-    manual_pnl = manual_total - manual_port_vs["starting_cash"]
-    manual_pnl_pct = (manual_pnl / manual_port_vs["starting_cash"]) * 100
-
-    bot_total = bot_status["total_value"]
-    bot_pnl = bot_status["pnl"]
-    bot_pnl_pct = bot_status["pnl_pct"]
-
-    st.markdown("### Head-to-Head")
-    h1, h2 = st.columns(2)
-
-    with h1:
-        st.markdown("**Your Portfolio**")
-        m1a, m1b, m1c = st.columns(3)
-        m1a.metric("Value", f"${manual_total:,.0f}")
-        m1b.metric("P&L", f"${manual_pnl:,.0f}")
-        m1c.metric("Return", f"{manual_pnl_pct:+.1f}%")
-
-        if not manual_holdings.empty:
-            st.dataframe(
-                manual_holdings[["Ticker", "Shares", "Market Value", "P&L (%)"]].reset_index(drop=True),
-                use_container_width=True, height=250,
-            )
-        else:
-            st.caption("No holdings. Use the Paper Trading tab to buy stocks.")
-
-    with h2:
-        st.markdown("**Robo Bot Portfolio**")
-        m2a, m2b, m2c = st.columns(3)
-        m2a.metric("Value", f"${bot_total:,.0f}")
-        m2b.metric("P&L", f"${bot_pnl:,.0f}")
-        m2c.metric("Return", f"{bot_pnl_pct:+.1f}%")
-
-        bot_holdings = bot_status["holdings"]
-        if not bot_holdings.empty:
-            display_bot = bot_holdings[["Ticker", "Shares", "Market Value", "P&L (%)"]].reset_index(drop=True) \
-                if "Market Value" in bot_holdings.columns else bot_holdings
-            st.dataframe(display_bot, use_container_width=True, height=250)
-        else:
-            st.caption("Bot hasn't traded yet. Click 'Run Bot Rebalance Now' above.")
-
-    st.divider()
-
-    st.markdown("### Performance Over Time")
-    manual_snaps = get_snapshots(manual_pid_vs)
-    bot_pid_vs = get_or_create_portfolio("Robo Bot", ptype="bot")
-    bot_snaps = get_snapshots(bot_pid_vs)
-
-    if not manual_snaps.empty or not bot_snaps.empty:
-        fig_vs = go.Figure()
-        if not manual_snaps.empty:
-            fig_vs.add_trace(go.Scatter(
-                x=manual_snaps["Date"], y=manual_snaps["Value"],
-                mode="lines+markers", name="You",
-                line=dict(color="#4F8BF9", width=2),
-            ))
-        if not bot_snaps.empty:
-            fig_vs.add_trace(go.Scatter(
-                x=bot_snaps["Date"], y=bot_snaps["Value"],
-                mode="lines+markers", name="Robo Bot",
-                line=dict(color="#F97316", width=2),
-            ))
-        fig_vs.add_hline(y=100_000, line_dash="dot", line_color="gray",
-                         annotation_text="Starting Cash")
-        fig_vs.update_layout(
-            height=400, margin=dict(t=20, b=20),
-            yaxis_title="Portfolio Value ($)",
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig_vs, use_container_width=True)
-    else:
-        st.info("Start trading and run the bot to see the performance comparison chart build up over time.")
-
-    st.divider()
-    st.markdown("### Bot Trade Log")
-    bot_trades = get_trade_log(bot_pid_vs)
-    if not bot_trades.empty:
-        st.dataframe(bot_trades, use_container_width=True, height=250)
-    else:
-        st.caption("No bot trades yet.")
-
-    # ── Challenge history ─────────────────────────────────────────────
-    history = get_challenge_history()
-    if history:
-        st.divider()
-        with st.expander("Past Challenges"):
-            for ch in history:
-                result_label = ch.get("winner", "—")
+        # ── Start a new challenge ─────────────────────────────────────────
+        if not challenge_vs or challenge_vs["status"] == "completed":
+            with st.expander("Start a New Challenge", expanded=not bool(challenge_vs)):
                 st.markdown(
-                    f"**{ch['name']}** — "
-                    f"Trade: {ch['trade_start']} to {ch['trade_end']}, "
-                    f"Hold until: {ch['challenge_end']} — "
-                    f"Result: **{result_label}** ({ch['status']})"
+                    "Set a **trading window** to pick your stocks, then a **hold period** "
+                    "where portfolios lock and the market decides the winner."
+                )
+                ch_col1, ch_col2, ch_col3, ch_col4 = st.columns(4)
+                with ch_col1:
+                    ch_name = st.text_input("Challenge name", value="Week 1 Challenge", key="ch_name")
+                with ch_col2:
+                    ch_trade_days = st.number_input("Trading window (days)", 1, 14, 5, key="ch_trade_days")
+                with ch_col3:
+                    ch_hold_days = st.number_input("Hold period (days)", 7, 90, 21, key="ch_hold_days")
+                with ch_col4:
+                    ch_cash = st.number_input("Starting cash ($)", 10_000, 1_000_000, 100_000,
+                                              step=10_000, key="ch_cash")
+
+                st.caption(
+                    f"You and the bot each get **${ch_cash:,.0f}**. "
+                    f"Trade for **{ch_trade_days} days**, then hold for **{ch_hold_days} days**. "
+                    f"Total challenge: **{ch_trade_days + ch_hold_days} days**."
                 )
 
-    st.divider()
-    if st.button("Reset Bot Portfolio", type="secondary", key="reset_bot"):
-        reset_portfolio(bot_pid_vs)
-        st.success("Bot portfolio reset.")
-        st.rerun()
+                if st.button("Start Challenge", type="primary", key="start_challenge"):
+                    create_challenge(ch_name, ch_trade_days, ch_hold_days, ch_cash)
+                    st.success(f"Challenge **{ch_name}** started! Both portfolios reset to ${ch_cash:,.0f}. Go make your picks!")
+                    st.rerun()
+
+        st.divider()
+
+        # ── Bot controls ──────────────────────────────────────────────────
+        vs_col1, vs_col2 = st.columns(2)
+
+        strategy_options = ["Auto (Best Fit)"] + list(PRESETS.keys())
+        with vs_col1:
+            bot_preset_vs = st.selectbox("Bot Strategy", strategy_options,
+                                         index=0, key="bot_strategy_vs")
+            bot_topn_vs = st.slider("Bot top N holdings", 3, 20, 10, key="bot_topn_vs")
+
+        if bot_preset_vs == "Auto (Best Fit)" and not df.empty:
+            auto_result = auto_select_strategy(df)
+            st.info(auto_result["reasoning"])
+            effective_preset = auto_result["preset"]
+        else:
+            effective_preset = bot_preset_vs if bot_preset_vs != "Auto (Best Fit)" else "No Preset"
+
+        with vs_col2:
+            st.markdown(" ")
+            st.markdown(" ")
+            if not trading_ok:
+                st.info("Bot trading is locked during the hold period.")
+            elif st.button("Run Bot Rebalance Now", type="primary", key="run_bot"):
+                if df.empty:
+                    st.warning("Load screener data first.")
+                else:
+                    with st.spinner("Bot is trading..."):
+                        result = bot_rebalance(
+                            screener_df=df,
+                            preset=effective_preset,
+                            top_n=bot_topn_vs,
+                        )
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        st.success(
+                            f"Bot chose **{effective_preset}** — "
+                            f"{len(result['buys'])} buys, "
+                            f"{len(result['sells'])} sells. "
+                            f"Portfolio: ${result['portfolio_value']:,.2f}"
+                        )
+                        st.rerun()
+
+        st.divider()
+
+        # ── Head-to-head comparison ───────────────────────────────────────
+        manual_pid_vs = get_or_create_portfolio("My Portfolio", ptype="manual")
+        manual_port_vs = get_portfolio(manual_pid_vs)
+        bot_status = get_bot_status("Robo Bot")
+
+        manual_holdings = get_holdings(manual_pid_vs)
+        if not manual_holdings.empty:
+            manual_holdings = enrich_holdings_with_prices(manual_holdings)
+            manual_mkt = manual_holdings["Market Value"].sum()
+        else:
+            manual_mkt = 0
+        manual_total = manual_port_vs["cash"] + manual_mkt
+        manual_pnl = manual_total - manual_port_vs["starting_cash"]
+        manual_pnl_pct = (manual_pnl / manual_port_vs["starting_cash"]) * 100
+
+        bot_total = bot_status["total_value"]
+        bot_pnl = bot_status["pnl"]
+        bot_pnl_pct = bot_status["pnl_pct"]
+
+        st.markdown("### Head-to-Head")
+        h1, h2 = st.columns(2)
+
+        with h1:
+            st.markdown("**Your Portfolio**")
+            m1a, m1b, m1c = st.columns(3)
+            m1a.metric("Value", f"${manual_total:,.0f}")
+            m1b.metric("P&L", f"${manual_pnl:,.0f}")
+            m1c.metric("Return", f"{manual_pnl_pct:+.1f}%")
+
+            if not manual_holdings.empty:
+                st.dataframe(
+                    manual_holdings[["Ticker", "Shares", "Market Value", "P&L (%)"]].reset_index(drop=True),
+                    use_container_width=True, height=250,
+                )
+            else:
+                st.caption("No holdings. Use the Paper Trading tab to buy stocks.")
+
+        with h2:
+            st.markdown("**Robo Bot Portfolio**")
+            m2a, m2b, m2c = st.columns(3)
+            m2a.metric("Value", f"${bot_total:,.0f}")
+            m2b.metric("P&L", f"${bot_pnl:,.0f}")
+            m2c.metric("Return", f"{bot_pnl_pct:+.1f}%")
+
+            bot_holdings = bot_status["holdings"]
+            if not bot_holdings.empty:
+                display_bot = bot_holdings[["Ticker", "Shares", "Market Value", "P&L (%)"]].reset_index(drop=True) \
+                    if "Market Value" in bot_holdings.columns else bot_holdings
+                st.dataframe(display_bot, use_container_width=True, height=250)
+            else:
+                st.caption("Bot hasn't traded yet. Click 'Run Bot Rebalance Now' above.")
+
+        st.divider()
+
+        st.markdown("### Performance Over Time")
+        manual_snaps = get_snapshots(manual_pid_vs)
+        bot_pid_vs = get_or_create_portfolio("Robo Bot", ptype="bot")
+        bot_snaps = get_snapshots(bot_pid_vs)
+
+        if not manual_snaps.empty or not bot_snaps.empty:
+            fig_vs = go.Figure()
+            if not manual_snaps.empty:
+                fig_vs.add_trace(go.Scatter(
+                    x=manual_snaps["Date"], y=manual_snaps["Value"],
+                    mode="lines+markers", name="You",
+                    line=dict(color="#4F8BF9", width=2),
+                ))
+            if not bot_snaps.empty:
+                fig_vs.add_trace(go.Scatter(
+                    x=bot_snaps["Date"], y=bot_snaps["Value"],
+                    mode="lines+markers", name="Robo Bot",
+                    line=dict(color="#F97316", width=2),
+                ))
+            fig_vs.add_hline(y=100_000, line_dash="dot", line_color="gray",
+                             annotation_text="Starting Cash")
+            fig_vs.update_layout(
+                height=400, margin=dict(t=20, b=20),
+                yaxis_title="Portfolio Value ($)",
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_vs, use_container_width=True)
+        else:
+            st.info("Start trading and run the bot to see the performance comparison chart build up over time.")
+
+        st.divider()
+        st.markdown("### Bot Trade Log")
+        bot_trades = get_trade_log(bot_pid_vs)
+        if not bot_trades.empty:
+            st.dataframe(bot_trades, use_container_width=True, height=250)
+        else:
+            st.caption("No bot trades yet.")
+
+        # ── Challenge history ─────────────────────────────────────────────
+        history = get_challenge_history()
+        if history:
+            st.divider()
+            with st.expander("Past Challenges"):
+                for ch in history:
+                    result_label = ch.get("winner", "—")
+                    st.markdown(
+                        f"**{ch['name']}** — "
+                        f"Trade: {ch['trade_start']} to {ch['trade_end']}, "
+                        f"Hold until: {ch['challenge_end']} — "
+                        f"Result: **{result_label}** ({ch['status']})"
+                    )
+
+        st.divider()
+        if st.button("Reset Bot Portfolio", type="secondary", key="reset_bot"):
+            reset_portfolio(bot_pid_vs)
+            st.success("Bot portfolio reset.")
+            st.rerun()
