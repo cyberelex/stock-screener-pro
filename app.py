@@ -45,6 +45,31 @@ def _score_watch_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values("Score", ascending=False, na_position="last")
 
 
+SCR_RESULTS_TABLE_KEY = "scr_main_table"
+
+
+def _dataframe_selection_rows(key: str) -> list[int]:
+    """Row indices currently selected in a Streamlit dataframe widget."""
+    state = st.session_state.get(key)
+    if not isinstance(state, dict):
+        return []
+    selection = state.get("selection")
+    if not isinstance(selection, dict):
+        return []
+    rows = selection.get("rows")
+    return list(rows) if rows else []
+
+
+def _mark_watchlist_rows(frame: pd.DataFrame, watchlist: list[str]) -> pd.DataFrame:
+    """Leftmost ★ column: filled star if the ticker is already saved."""
+    out = frame.copy()
+    if out.empty or "Ticker" not in out.columns:
+        return out
+    on_list = set(watchlist)
+    out.insert(0, "★", out["Ticker"].map(lambda t: "★" if t in on_list else ""))
+    return out
+
+
 def _watchlist_column_config() -> dict:
     return {
         "Score": st.column_config.ProgressColumn(
@@ -487,6 +512,7 @@ with tab_table:
     display_df = filtered[show_cols].copy()
     display_df["Market Cap"] = (display_df["Market Cap"] / 1e9).round(1)
     display_df = display_df.rename(columns={"Market Cap": "Mkt Cap ($B)"})
+    display_df = _mark_watchlist_rows(display_df, saved_watchlist)
 
     if preset_name == "Long-Term Hold":
         score_help = "0–100 hold-quality checklist: scale, margins, growth, valuation, stability."
@@ -501,11 +527,49 @@ with tab_table:
         setup_help = "Tier labels apply to AI Momentum and Long-Term Hold presets only."
         note_help = "Setup notes apply to AI Momentum and Long-Term Hold presets only."
 
-    st.dataframe(
-        display_df.reset_index(drop=True),
-        use_container_width=True,
-        height=600,
-        column_config={
+    selected_rows = _dataframe_selection_rows(SCR_RESULTS_TABLE_KEY)
+    selected_tickers = [
+        display_df.iloc[i]["Ticker"]
+        for i in selected_rows
+        if 0 <= i < len(display_df)
+    ]
+    to_add = [t for t in selected_tickers if t not in saved_watchlist]
+    to_remove = [t for t in selected_tickers if t in saved_watchlist]
+
+    wl_btn1, wl_btn2, wl_hint = st.columns([1, 1, 3])
+    with wl_btn1:
+        if st.button(
+            "★ Add to watchlist",
+            type="primary",
+            disabled=not to_add,
+            key="scr_wl_add_selected",
+            help="Select one or more rows in the table below, then click here.",
+        ):
+            for ticker in to_add:
+                add_to_watchlist(ticker)
+            st.rerun()
+    with wl_btn2:
+        if st.button(
+            "Remove from watchlist",
+            disabled=not to_remove,
+            key="scr_wl_remove_selected",
+            help="Select saved names (★ in the first column), then click here.",
+        ):
+            for ticker in to_remove:
+                remove_from_watchlist(ticker)
+            st.rerun()
+    with wl_hint:
+        if selected_tickers:
+            st.caption(f"Selected: {', '.join(selected_tickers)}")
+        else:
+            st.caption("Click row(s) in the table, then use the buttons on the left.")
+
+    results_column_config = {
+            "★": st.column_config.TextColumn(
+                "★",
+                help="Already on My Watchlist. Select rows and use the buttons above to add or remove.",
+                width="small",
+            ),
             "Score": st.column_config.ProgressColumn(
                 "Score", min_value=0, max_value=100, format="%.0f",
                 help=score_help,
@@ -626,42 +690,21 @@ with tab_table:
                 format="%+.1f",
                 help="1-month return minus NVDA's 1-month return. Positive = outperforming NVDA.",
             ),
-        },
-    )
-    st.caption(f"Showing {len(filtered)} of {len(df)} stocks · Ranked by {preset_name} score")
+        }
 
-    # ── Add to personal watchlist ─────────────────────────────────────
-    add_source = filtered if not filtered.empty else df
-    if not add_source.empty:
-        st.divider()
-        st.markdown("**Add to My Watchlist**")
-        wa1, wa2, wa3 = st.columns([2, 1, 2])
-        with wa1:
-            add_ticker = st.selectbox(
-                "Stock",
-                add_source["Ticker"].tolist(),
-                key="scr_watch_ticker",
-            )
-        with wa2:
-            st.write("")
-            st.write("")
-            if add_ticker in saved_watchlist:
-                if st.button("Remove", key="scr_watch_remove"):
-                    remove_from_watchlist(add_ticker)
-                    st.rerun()
-            else:
-                if st.button("Add to Watchlist", type="primary", key="scr_watch_add"):
-                    err = add_to_watchlist(add_ticker)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.success(f"Added {add_ticker}")
-                        st.rerun()
-        with wa3:
-            if add_ticker in saved_watchlist:
-                st.caption(f"{add_ticker} is on My Watchlist")
-            else:
-                st.caption("Opens on the My Watchlist tab")
+    st.dataframe(
+        display_df.reset_index(drop=True),
+        use_container_width=True,
+        height=600,
+        column_config=results_column_config,
+        on_select="rerun",
+        selection_mode="multi-row",
+        key=SCR_RESULTS_TABLE_KEY,
+    )
+    st.caption(
+        f"Showing {len(filtered)} of {len(df)} stocks · Ranked by {preset_name} score · "
+        "★ = on My Watchlist · select row(s) and use the buttons above to add or remove"
+    )
 
     # ── Quick Buy from screener ───────────────────────────────────────
     if mode == "Timing" and not filtered.empty:
